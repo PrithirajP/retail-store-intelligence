@@ -1,0 +1,30 @@
+# Environments
+venv/
+env/
+.env
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data & Video Files (CRITICAL for CV projects)
+data/*
+!data/.gitkeep
+*.mp4
+*.avi
+*.mkv
+
+# SQLite Database
+*.db
+*.sqlite3
+
+# Ultralytics/YOLO generated files
+runs/
+yolov8n.pt
+yolov8n.onnx
+
+# OS/Editor
+.DS_Store
+.idea/
+.vscode/

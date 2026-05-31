@@ -8,11 +8,19 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Mount the local data folder to /app/data inside the container
-      # This is critical for seed_data.py to find the CSV
       - ./data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  store-dashboard:
+    build:
+      context: ./dashboard
+    container_name: store-dashboard
+    ports:
+      - "8501:8501"
+    depends_on:
+      store-api:
+        condition: service_healthy

@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  store-api:
+    build: 
+      context: ./api
+    container_name: store-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount the local data folder to /app/data inside the container
+      # This is critical for seed_data.py to find the CSV
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

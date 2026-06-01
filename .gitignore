@@ -1,30 +1,50 @@
-# Environments
-venv/
-env/
-.env
-
-# Python Cache
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
+*.pyd
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# Data & Video Files (CRITICAL for CV projects)
-data/*
-!data/.gitkeep
-*.mp4
-*.avi
-*.mkv
+# Virtual environments
+venv/
+.env/
+.venv/
+ENV/
 
-# SQLite Database
+# Local environment/config
+.env
+.env.*
+!.env.example
+
+# Databases and runtime state
 *.db
+*.sqlite
 *.sqlite3
+store_intelligence.db
 
-# Ultralytics/YOLO generated files
-runs/
+# Model weights / generated ML artifacts
 yolov8n.pt
-yolov8n.onnx
+*.pt
+runs/
 
-# OS/Editor
+# Data files - challenge data should not be committed
+data/*.mp4
+data/*.avi
+data/*.mov
+data/*.mkv
+data/*.csv
+
+# OS/editor files
 .DS_Store
-.idea/
+Thumbs.db
 .vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml

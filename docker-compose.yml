@@ -2,12 +2,13 @@ version: '3.8'
 
 services:
   store-api:
-    build: 
+    build:
       context: ./api
     container_name: store-api
     ports:
       - "8000:8000"
     volumes:
+      # Mount challenge data so api/seed_data.py can read the POS CSV.
       - ./data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]

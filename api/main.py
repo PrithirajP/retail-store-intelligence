@@ -79,6 +79,21 @@ def _datetime_to_iso(value) -> Optional[str]:
     return normalized.isoformat() if normalized is not None else None
 
 
+def _milliseconds_between(start_time, end_time) -> Optional[int]:
+    start_dt = _normalize_datetime_to_utc(start_time)
+    end_dt = _normalize_datetime_to_utc(end_time)
+
+    if start_dt is None or end_dt is None:
+        return None
+
+    delta_ms = int((end_dt - start_dt).total_seconds() * 1000)
+
+    if delta_ms < 0:
+        return None
+
+    return delta_ms
+
+
 # ---------------------------------------------------------------------
 # Health helpers
 # ---------------------------------------------------------------------
@@ -531,6 +546,121 @@ def _get_latest_event_timestamp(db: Session, store_id: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------
+# Queue / Funnel helpers
+# ---------------------------------------------------------------------
+
+def _get_queue_events(db: Session, store_id: str) -> list:
+    """
+    Fetch billing queue join/exit events from the raw event stream.
+
+    This avoids relying entirely on VisitorSession because global Re-ID is not
+    implemented yet, and billing-camera visitor IDs may not match entrance IDs.
+    """
+
+    return (
+        db.query(
+            EventRecord.visitor_id,
+            EventRecord.event_type,
+            EventRecord.timestamp,
+            EventRecord.session_seq,
+        )
+        .filter(
+            EventRecord.store_id == store_id,
+            EventRecord.is_staff == False,
+            EventRecord.event_type.in_(
+                ["BILLING_QUEUE_JOIN", "BILLING_QUEUE_EXIT"]
+            ),
+        )
+        .order_by(
+            EventRecord.timestamp.asc(),
+            EventRecord.session_seq.asc().nullsfirst(),
+        )
+        .all()
+    )
+
+
+def _get_queue_cycles(db: Session, store_id: str) -> dict:
+    """
+    Build queue cycles from BILLING_QUEUE_JOIN and BILLING_QUEUE_EXIT events.
+
+    For each visitor:
+    - JOIN starts an open cycle.
+    - EXIT closes the latest open cycle.
+    - JOIN without EXIT contributes to current_queue_depth.
+    """
+
+    queue_events = _get_queue_events(db, store_id)
+
+    open_join_by_visitor = {}
+    completed_cycles = []
+    joined_visitors = set()
+
+    for event in queue_events:
+        visitor_id = event.visitor_id
+        event_type = event.event_type
+
+        if event_type == "BILLING_QUEUE_JOIN":
+            joined_visitors.add(visitor_id)
+
+            # If repeated JOIN occurs before EXIT, keep the earliest open join.
+            if visitor_id not in open_join_by_visitor:
+                open_join_by_visitor[visitor_id] = event.timestamp
+
+        elif event_type == "BILLING_QUEUE_EXIT":
+            join_time = open_join_by_visitor.pop(visitor_id, None)
+
+            if join_time is None:
+                # EXIT without JOIN is ignored for wait-time calculation.
+                continue
+
+            wait_ms = _milliseconds_between(join_time, event.timestamp)
+
+            if wait_ms is None:
+                continue
+
+            completed_cycles.append(
+                {
+                    "visitor_id": visitor_id,
+                    "join_time": _datetime_to_iso(join_time),
+                    "exit_time": _datetime_to_iso(event.timestamp),
+                    "wait_ms": wait_ms,
+                }
+            )
+
+    return {
+        "joined_visitors": joined_visitors,
+        "completed_cycles": completed_cycles,
+        "open_queue_visitors": set(open_join_by_visitor.keys()),
+    }
+
+
+def _compute_queue_summary(db: Session, store_id: str) -> dict:
+    queue_state = _get_queue_cycles(db, store_id)
+
+    joined_count = len(queue_state["joined_visitors"])
+    completed_cycles = queue_state["completed_cycles"]
+    completed_queue_cycles = len(completed_cycles)
+    current_queue_depth = len(queue_state["open_queue_visitors"])
+
+    if completed_cycles:
+        avg_queue_wait_ms = round(
+            sum(cycle["wait_ms"] for cycle in completed_cycles)
+            / completed_queue_cycles,
+            2,
+        )
+    else:
+        avg_queue_wait_ms = 0.0
+
+    return {
+        "entered_billing_queue": joined_count,
+        "completed_queue_cycles": completed_queue_cycles,
+        "current_queue_depth": current_queue_depth,
+        "avg_queue_wait_ms": avg_queue_wait_ms,
+        "queue_data_source": "event_stream",
+    }
+
+
+# ---------------------------------------------------------------------
 # Heatmap helpers
 # ---------------------------------------------------------------------
 
@@ -670,7 +800,8 @@ async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
         else 0.0
     )
 
-    current_queue_depth = _compute_current_queue_depth(db, store_id)
+    queue_summary = _compute_queue_summary(db, store_id)
+
     avg_dwell_ms_by_zone = _compute_avg_dwell_by_zone(db, store_id)
     total_events = _get_total_event_count(db, store_id)
     last_event_timestamp = _get_latest_event_timestamp(db, store_id)
@@ -680,7 +811,8 @@ async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
         "total_visitors": total_visitors,
         "converted_visitors": converted_visitors,
         "conversion_rate_percentage": round(conversion_rate, 2),
-        "current_queue_depth": current_queue_depth,
+        "current_queue_depth": queue_summary["current_queue_depth"],
+        "avg_queue_wait_ms": queue_summary["avg_queue_wait_ms"],
         "avg_dwell_ms_by_zone": avg_dwell_ms_by_zone,
         "total_events": total_events,
         "last_event_timestamp": last_event_timestamp,
@@ -734,21 +866,20 @@ async def get_store_heatmap(store_id: str, db: Session = Depends(get_db)):
 
 @app.get("/stores/{store_id}/funnel", tags=["Analytics"])
 async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
+    """
+    Returns shopper funnel metrics.
+
+    Queue analytics are now derived from raw BILLING_QUEUE_JOIN/EXIT events.
+    This is intentional because global cross-camera Re-ID is not fully
+    implemented yet, so raw billing queue participation is more reliable
+    than relying only on VisitorSession.billing_exit_time.
+    """
+
     entered_store = (
         db.query(VisitorSession)
         .filter(
             VisitorSession.store_id == store_id,
             VisitorSession.is_staff == False,
-        )
-        .count()
-    )
-
-    entered_billing = (
-        db.query(VisitorSession)
-        .filter(
-            VisitorSession.store_id == store_id,
-            VisitorSession.is_staff == False,
-            VisitorSession.billing_exit_time != None,
         )
         .count()
     )
@@ -763,7 +894,18 @@ async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
         .count()
     )
 
-    abandoned_queue = max(entered_billing - converted, 0)
+    queue_summary = _compute_queue_summary(db, store_id)
+
+    entered_billing = queue_summary["entered_billing_queue"]
+    completed_queue_cycles = queue_summary["completed_queue_cycles"]
+
+    queue_abandonment_count = max(completed_queue_cycles - converted, 0)
+
+    queue_abandonment_rate = (
+        round(queue_abandonment_count / completed_queue_cycles * 100, 2)
+        if completed_queue_cycles > 0
+        else 0.0
+    )
 
     return {
         "store_id": store_id,
@@ -773,12 +915,11 @@ async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
             "3_completed_purchase": converted,
         },
         "insights": {
-            "queue_abandonment_count": abandoned_queue,
-            "queue_abandonment_rate": round(
-                abandoned_queue / entered_billing * 100,
-                2,
-            )
-            if entered_billing > 0
-            else 0.0,
+            "queue_abandonment_count": queue_abandonment_count,
+            "queue_abandonment_rate": queue_abandonment_rate,
+            "avg_queue_wait_ms": queue_summary["avg_queue_wait_ms"],
+            "completed_queue_cycles": completed_queue_cycles,
+            "current_queue_depth": queue_summary["current_queue_depth"],
+            "queue_data_source": queue_summary["queue_data_source"],
         },
     }

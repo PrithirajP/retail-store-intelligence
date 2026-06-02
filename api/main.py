@@ -1,161 +1,325 @@
 from sqlalchemy.orm import Session
-from database import get_db, EventRecord, VisitorSession, correlate_billing_exit
 from sqlalchemy.exc import IntegrityError
-from fastapi import FastAPI, HTTPException, status, Depends, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, status, Depends
 import logging
-from models import EventIngestRequest, EventIngestResponse
-from sqlalchemy import func
 from contextlib import asynccontextmanager
+
+from database import (
+    get_db,
+    EventRecord,
+    VisitorSession,
+    correlate_billing_exit,
+)
+from models import EventIngestRequest, EventIngestResponse
 from seed_data import seed_pos_data
 
-# Configure basic logging
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # This runs exactly once when the container starts up
+    """
+    Application startup lifecycle.
+
+    Seeds POS data from the mounted /app/data directory before normal use.
+    If seeding fails, the API still starts so that health checks and basic
+    API inspection do not crash.
+    """
+
     logger.info("Initializing Store API...")
+
     try:
-        # Hardcode the path assuming it's mounted in docker-compose
         seed_pos_data("/app/data/Brigade_Bangalore_10_April_26.csv")
     except Exception as e:
-        logger.error(f"Failed to seed data on startup: {e}")
+        logger.error("Failed to seed data on startup: %s", e)
+
     yield
-    
+
 
 app = FastAPI(
     title="Store Intelligence API",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
+
 
 @app.get("/health", tags=["System"])
 async def health_check():
-    """Endpoint for Docker to verify the API is ready to accept traffic."""
+    """
+    Basic health endpoint.
+
+    Milestone 5 will upgrade this to include last event timestamp and
+    stale feed status.
+    """
+
     return {"status": "healthy"}
 
+
+def _create_event_record(event_in) -> EventRecord:
+    """
+    Convert a validated Pydantic event into a SQLAlchemy EventRecord.
+
+    Persists full Event Schema v1.2 fields including flattened metadata.
+    """
+
+    metadata = event_in.metadata
+
+    return EventRecord(
+        event_id=str(event_in.event_id),
+        store_id=event_in.store_id,
+        camera_id=event_in.camera_id,
+        visitor_id=event_in.visitor_id,
+        event_type=event_in.event_type.value,
+        timestamp=event_in.timestamp,
+        zone_id=event_in.zone_id,
+        dwell_ms=event_in.dwell_ms,
+        is_staff=event_in.is_staff,
+        confidence=event_in.confidence,
+        queue_depth=metadata.queue_depth,
+        sku_zone=metadata.sku_zone,
+        session_seq=metadata.session_seq,
+    )
+
+
+def _get_session(db: Session, visitor_id: str):
+    return (
+        db.query(VisitorSession)
+        .filter(VisitorSession.visitor_id == visitor_id)
+        .first()
+    )
+
+
+def _create_or_update_entry_session(db: Session, event_in) -> VisitorSession:
+    """
+    Create or update a visitor session from an ENTRY event.
+
+    This keeps the session table as a materialized lifecycle view.
+    """
+
+    session = _get_session(db, event_in.visitor_id)
+
+    if session is None:
+        session = VisitorSession(
+            visitor_id=event_in.visitor_id,
+            store_id=event_in.store_id,
+            entry_time=event_in.timestamp,
+            last_seen_time=event_in.timestamp,
+            is_staff=event_in.is_staff,
+        )
+        db.add(session)
+        return session
+
+    if session.entry_time is None:
+        session.entry_time = event_in.timestamp
+
+    session.last_seen_time = event_in.timestamp
+
+    if event_in.is_staff:
+        session.is_staff = True
+
+    return session
+
+
+def _update_existing_session_from_event(db: Session, event_in):
+    """
+    Update derived session state using non-ENTRY events.
+
+    Important:
+    This function does not create sessions for every random zone event.
+    The top-of-funnel session still starts from ENTRY. This avoids inflating
+    total visitors from cameras that do not observe the entrance.
+    """
+
+    session = _get_session(db, event_in.visitor_id)
+
+    if session is None:
+        return None
+
+    session.last_seen_time = event_in.timestamp
+
+    if event_in.is_staff:
+        session.is_staff = True
+
+    event_type = event_in.event_type.value
+
+    if event_type == "BILLING_QUEUE_JOIN":
+        session.billing_join_time = event_in.timestamp
+
+    elif event_type == "BILLING_QUEUE_EXIT":
+        session.billing_exit_time = event_in.timestamp
+
+    return session
+
+
 @app.post(
-    "/events/ingest", 
-    response_model=EventIngestResponse, 
+    "/events/ingest",
+    response_model=EventIngestResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    tags=["Ingestion"]
+    tags=["Ingestion"],
 )
 async def ingest_events(payload: EventIngestRequest, db: Session = Depends(get_db)):
+    """
+    Ingest a batch of CV-generated events.
+
+    Current behavior:
+    - Validates event payloads through Pydantic.
+    - Inserts raw event records with event_id idempotency.
+    - Updates the materialized VisitorSession table.
+    - Triggers POS correlation on BILLING_QUEUE_EXIT.
+    """
+
     processed_count = 0
     errors = []
 
     for event_in in payload.events:
-        # 1. Idempotency Check: Try to insert the raw event
-        db_event = EventRecord(
-            event_id=str(event_in.event_id),
-            store_id=event_in.store_id,
-            visitor_id=event_in.visitor_id,
-            event_type=event_in.event_type.value,
-            timestamp=event_in.timestamp
-        )
+        db_event = _create_event_record(event_in)
+
         db.add(db_event)
-        
+
         try:
             db.commit()
             processed_count += 1
         except IntegrityError:
-            # Event already exists, ignore it safely (Idempotent)
+            # Duplicate event_id: idempotent skip.
             db.rollback()
             continue
 
-        # 2. Update Materialized Session
-        session = db.query(VisitorSession).filter(VisitorSession.visitor_id == event_in.visitor_id).first()
-        if not session and event_in.event_type.value == "ENTRY":
-            session = VisitorSession(
-                visitor_id=event_in.visitor_id,
-                store_id=event_in.store_id,
-                entry_time=event_in.timestamp,
-                is_staff=event_in.is_staff
-            )
-            db.add(session)
-            db.commit()
+        event_type = event_in.event_type.value
 
-        # 3. Trigger POS Correlation on Billing Exit
-        if event_in.event_type.value == "BILLING_QUEUE_EXIT":
-            if session:
-                session.billing_exit_time = event_in.timestamp
+        try:
+            if event_type == "ENTRY":
+                _create_or_update_entry_session(db, event_in)
                 db.commit()
-                # Run the correlation engine
-                correlate_billing_exit(db, event_in.visitor_id, event_in.store_id, event_in.timestamp)
+
+            else:
+                session = _update_existing_session_from_event(db, event_in)
+                db.commit()
+
+                if event_type == "BILLING_QUEUE_EXIT" and session is not None:
+                    correlate_billing_exit(
+                        db=db,
+                        visitor_id=event_in.visitor_id,
+                        store_id=event_in.store_id,
+                        exit_time=event_in.timestamp,
+                    )
+
+        except Exception as e:
+            db.rollback()
+            logger.error(
+                "Failed to update session state for event %s: %s",
+                event_in.event_id,
+                e,
+            )
+            errors.append(
+                {
+                    "event_id": str(event_in.event_id),
+                    "error": str(e),
+                }
+            )
 
     return EventIngestResponse(
-        status="success",
+        status="success" if not errors else "partial_success",
         processed_count=processed_count,
-        errors=errors if errors else None
+        errors=errors if errors else None,
     )
+
 
 @app.get("/stores/{store_id}/metrics", tags=["Analytics"])
 async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
     """
     Returns the real-time North Star Metric: Conversion Rate.
-    Excludes staff from all calculations.
+
+    Staff sessions are excluded from customer metrics.
     """
-    # 1. Top of Funnel: Total Unique Visitors
-    total_visitors = db.query(VisitorSession).filter(
-        VisitorSession.store_id == store_id,
-        VisitorSession.is_staff == False
-    ).count()
 
-    # 2. Bottom of Funnel: Converted Visitors
-    converted_visitors = db.query(VisitorSession).filter(
-        VisitorSession.store_id == store_id,
-        VisitorSession.is_staff == False,
-        VisitorSession.is_converted == True
-    ).count()
+    total_visitors = (
+        db.query(VisitorSession)
+        .filter(
+            VisitorSession.store_id == store_id,
+            VisitorSession.is_staff == False,
+        )
+        .count()
+    )
 
-    # 3. Calculate North Star Metric safely (avoid Divide by Zero)
-    conversion_rate = (converted_visitors / total_visitors * 100) if total_visitors > 0 else 0.0
+    converted_visitors = (
+        db.query(VisitorSession)
+        .filter(
+            VisitorSession.store_id == store_id,
+            VisitorSession.is_staff == False,
+            VisitorSession.is_converted == True,
+        )
+        .count()
+    )
+
+    conversion_rate = (
+        converted_visitors / total_visitors * 100
+        if total_visitors > 0
+        else 0.0
+    )
 
     return {
         "store_id": store_id,
         "total_visitors": total_visitors,
         "converted_visitors": converted_visitors,
-        "conversion_rate_percentage": round(conversion_rate, 2)
+        "conversion_rate_percentage": round(conversion_rate, 2),
     }
+
 
 @app.get("/stores/{store_id}/funnel", tags=["Analytics"])
 async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
     """
-    Returns a step-by-step drop-off funnel for the store.
+    Returns a basic shopper funnel.
+
+    Current funnel:
+    Entry -> Billing Queue -> Purchase
     """
-    # Total valid visitors
-    entered_store = db.query(VisitorSession).filter(
-        VisitorSession.store_id == store_id,
-        VisitorSession.is_staff == False
-    ).count()
 
-    # Visitors who made it to the billing queue
-    entered_billing = db.query(VisitorSession).filter(
-        VisitorSession.store_id == store_id,
-        VisitorSession.is_staff == False,
-        VisitorSession.billing_exit_time != None
-    ).count()
+    entered_store = (
+        db.query(VisitorSession)
+        .filter(
+            VisitorSession.store_id == store_id,
+            VisitorSession.is_staff == False,
+        )
+        .count()
+    )
 
-    # Visitors who actually bought something
-    converted = db.query(VisitorSession).filter(
-        VisitorSession.store_id == store_id,
-        VisitorSession.is_staff == False,
-        VisitorSession.is_converted == True
-    ).count()
+    entered_billing = (
+        db.query(VisitorSession)
+        .filter(
+            VisitorSession.store_id == store_id,
+            VisitorSession.is_staff == False,
+            VisitorSession.billing_exit_time != None,
+        )
+        .count()
+    )
 
-    # Calculate queue abandonment
-    abandoned_queue = entered_billing - converted
+    converted = (
+        db.query(VisitorSession)
+        .filter(
+            VisitorSession.store_id == store_id,
+            VisitorSession.is_staff == False,
+            VisitorSession.is_converted == True,
+        )
+        .count()
+    )
+
+    abandoned_queue = max(entered_billing - converted, 0)
 
     return {
         "store_id": store_id,
         "funnel_steps": {
             "1_entered_store": entered_store,
             "2_entered_billing_queue": entered_billing,
-            "3_completed_purchase": converted
+            "3_completed_purchase": converted,
         },
         "insights": {
             "queue_abandonment_count": abandoned_queue,
-            "queue_abandonment_rate": round((abandoned_queue / entered_billing * 100), 2) if entered_billing > 0 else 0.0
-        }
+            "queue_abandonment_rate": round(
+                abandoned_queue / entered_billing * 100,
+                2,
+            )
+            if entered_billing > 0
+            else 0.0,
+        },
     }

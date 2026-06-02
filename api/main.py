@@ -1,11 +1,14 @@
 from typing import Any, List, Optional
 from datetime import datetime, timezone, timedelta
+import json
+import logging
+import time
+import uuid
 
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func, text
-from fastapi import FastAPI, status, Depends, Body
-import logging
+from fastapi import FastAPI, status, Depends, Body, Request
 from contextlib import asynccontextmanager
 from pydantic import ValidationError
 
@@ -63,6 +66,106 @@ app = FastAPI(
     title="Store Intelligence API",
     lifespan=lifespan,
 )
+
+
+# ---------------------------------------------------------------------
+# Structured logging helpers
+# ---------------------------------------------------------------------
+
+def _extract_store_id_from_path(path: str) -> Optional[str]:
+    """
+    Extract store_id from paths like:
+    /stores/ST1008/metrics
+    /stores/ST1008/funnel
+    /stores/ST1008/heatmap
+    /stores/ST1008/anomalies
+    """
+
+    parts = [part for part in path.split("/") if part]
+
+    if len(parts) >= 2 and parts[0] == "stores":
+        return parts[1]
+
+    return None
+
+
+def _get_or_create_trace_id(request: Request) -> str:
+    """
+    Use incoming trace ID if provided; otherwise generate one.
+    """
+
+    return request.headers.get("X-Trace-Id") or str(uuid.uuid4())
+
+
+def _log_json(payload: dict):
+    """
+    Emit one structured JSON log line using standard logging.
+    """
+
+    logger.info(json.dumps(payload, sort_keys=True, default=str))
+
+
+@app.middleware("http")
+async def structured_logging_middleware(request: Request, call_next):
+    """
+    Structured request logging middleware.
+
+    Logs:
+    - trace_id
+    - method
+    - endpoint
+    - status_code
+    - latency_ms
+    - store_id
+    - client_host
+
+    Important:
+    The middleware does not read the request body, so it does not interfere
+    with /events/ingest payload parsing.
+    """
+
+    start_time = time.perf_counter()
+    trace_id = _get_or_create_trace_id(request)
+    request.state.trace_id = trace_id
+
+    status_code = 500
+    error = None
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Trace-Id"] = trace_id
+        return response
+
+    except Exception as exc:
+        error = {
+            "type": exc.__class__.__name__,
+            "message": str(exc),
+        }
+        raise
+
+    finally:
+        latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+
+        client_host = None
+        if request.client is not None:
+            client_host = request.client.host
+
+        log_payload = {
+            "event": "api_request",
+            "trace_id": trace_id,
+            "method": request.method,
+            "endpoint": request.url.path,
+            "status_code": status_code,
+            "latency_ms": latency_ms,
+            "store_id": _extract_store_id_from_path(request.url.path),
+            "client_host": client_host,
+        }
+
+        if error is not None:
+            log_payload["error"] = error
+
+        _log_json(log_payload)
 
 
 # ---------------------------------------------------------------------
@@ -376,13 +479,14 @@ def _determine_ingest_status(
     tags=["Ingestion"],
 )
 async def ingest_events(
+    request: Request,
     payload: Any = Body(...),
     db: Session = Depends(get_db),
 ):
     raw_events, envelope_errors = _validate_payload_shape(payload)
 
     if raw_events is None:
-        return EventIngestResponse(
+        response = EventIngestResponse(
             status="failed",
             received_count=0,
             processed_count=0,
@@ -390,6 +494,20 @@ async def ingest_events(
             error_count=len(envelope_errors),
             errors=envelope_errors,
         )
+
+        _log_json(
+            {
+                "event": "event_ingest_batch",
+                "trace_id": getattr(request.state, "trace_id", None),
+                "status": response.status,
+                "received_count": response.received_count,
+                "processed_count": response.processed_count,
+                "duplicate_count": response.duplicate_count,
+                "error_count": response.error_count,
+            }
+        )
+
+        return response
 
     received_count = len(raw_events)
     processed_count = 0
@@ -466,6 +584,18 @@ async def ingest_events(
         processed_count=processed_count,
         duplicate_count=duplicate_count,
         error_count=error_count,
+    )
+
+    _log_json(
+        {
+            "event": "event_ingest_batch",
+            "trace_id": getattr(request.state, "trace_id", None),
+            "status": response_status,
+            "received_count": received_count,
+            "processed_count": processed_count,
+            "duplicate_count": duplicate_count,
+            "error_count": error_count,
+        }
     )
 
     return EventIngestResponse(

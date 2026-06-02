@@ -3,11 +3,10 @@
 # The tests should use an isolated test database and FastAPI TestClient.
 #
 # HUMAN CHANGES:
-# Adapted imports to the current repository structure where api/main.py imports
-# database.py and models.py as local modules. Added sys.path handling so tests
-# can run from the project root on Windows and Linux.
+# Switched to an in-memory SQLite database with StaticPool to avoid Windows
+# file-lock errors during teardown. Added sys.path handling so tests can run
+# from the project root on Windows and Linux.
 
-import os
 import sys
 import uuid
 from pathlib import Path
@@ -16,6 +15,7 @@ from datetime import datetime, timezone
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,17 +28,19 @@ if str(API_DIR) not in sys.path:
 import database  # noqa: E402
 
 
-TEST_DATABASE_URL = "sqlite:///./test_store_intelligence.db"
+TEST_DATABASE_URL = "sqlite:///:memory:"
 
 test_engine = create_engine(
     TEST_DATABASE_URL,
     connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
 )
 
-# Rebind the existing SessionLocal to the test database.
+# Rebind the existing SessionLocal to the in-memory test database.
 database.engine = test_engine
 database.SessionLocal.configure(bind=test_engine)
 
+import main  # noqa: E402
 from main import app  # noqa: E402
 
 
@@ -58,14 +60,18 @@ def reset_test_database():
 
     database.Base.metadata.drop_all(bind=test_engine)
 
-    try:
-        os.remove("test_store_intelligence.db")
-    except FileNotFoundError:
-        pass
-
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    """
+    FastAPI test client.
+
+    We skip POS CSV seeding during tests because the Docker path /app/data
+    does not exist during local pytest runs.
+    """
+
+    monkeypatch.setattr(main, "seed_pos_data", lambda *_args, **_kwargs: None)
+
     with TestClient(app) as test_client:
         yield test_client
 

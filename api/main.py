@@ -1,8 +1,11 @@
+from typing import Any, Dict, List, Optional
+
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from fastapi import FastAPI, status, Depends
+from fastapi import FastAPI, status, Depends, Body
 import logging
 from contextlib import asynccontextmanager
+from pydantic import ValidationError
 
 from database import (
     get_db,
@@ -10,7 +13,7 @@ from database import (
     VisitorSession,
     correlate_billing_exit,
 )
-from models import EventIngestRequest, EventIngestResponse
+from models import Event, EventIngestResponse
 from seed_data import seed_pos_data
 
 
@@ -56,7 +59,7 @@ async def health_check():
     return {"status": "healthy"}
 
 
-def _create_event_record(event_in) -> EventRecord:
+def _create_event_record(event_in: Event) -> EventRecord:
     """
     Convert a validated Pydantic event into a SQLAlchemy EventRecord.
 
@@ -82,7 +85,7 @@ def _create_event_record(event_in) -> EventRecord:
     )
 
 
-def _get_session(db: Session, visitor_id: str):
+def _get_session(db: Session, visitor_id: str) -> Optional[VisitorSession]:
     return (
         db.query(VisitorSession)
         .filter(VisitorSession.visitor_id == visitor_id)
@@ -90,7 +93,7 @@ def _get_session(db: Session, visitor_id: str):
     )
 
 
-def _create_or_update_entry_session(db: Session, event_in) -> VisitorSession:
+def _create_or_update_entry_session(db: Session, event_in: Event) -> VisitorSession:
     """
     Create or update a visitor session from an ENTRY event.
 
@@ -121,7 +124,10 @@ def _create_or_update_entry_session(db: Session, event_in) -> VisitorSession:
     return session
 
 
-def _update_existing_session_from_event(db: Session, event_in):
+def _update_existing_session_from_event(
+    db: Session,
+    event_in: Event,
+) -> Optional[VisitorSession]:
     """
     Update derived session state using non-ENTRY events.
 
@@ -152,37 +158,176 @@ def _update_existing_session_from_event(db: Session, event_in):
     return session
 
 
+def _validate_payload_shape(payload: Any) -> tuple[Optional[List[dict]], List[dict]]:
+    """
+    Validate only the outer batch envelope.
+
+    Returns:
+        (raw_events, errors)
+
+    This avoids FastAPI rejecting the whole batch with 422 when just one event
+    is malformed. Individual event validation happens later.
+    """
+
+    if not isinstance(payload, dict):
+        return None, [
+            {
+                "index": None,
+                "event_id": None,
+                "error": "Request body must be a JSON object containing an 'events' list.",
+            }
+        ]
+
+    if "events" not in payload:
+        return None, [
+            {
+                "index": None,
+                "event_id": None,
+                "error": "Missing required top-level key: events",
+            }
+        ]
+
+    raw_events = payload.get("events")
+
+    if not isinstance(raw_events, list):
+        return None, [
+            {
+                "index": None,
+                "event_id": None,
+                "error": "The 'events' field must be a list.",
+            }
+        ]
+
+    if len(raw_events) > 500:
+        return None, [
+            {
+                "index": None,
+                "event_id": None,
+                "error": "Batch size exceeds maximum allowed length of 500 events.",
+            }
+        ]
+
+    return raw_events, []
+
+
+def _validate_raw_event(raw_event: Any, index: int) -> tuple[Optional[Event], Optional[dict]]:
+    """
+    Validate a single raw event dictionary with Pydantic.
+
+    One malformed event should not reject the whole batch.
+    """
+
+    if not isinstance(raw_event, dict):
+        return None, {
+            "index": index,
+            "event_id": None,
+            "error": "Event must be a JSON object.",
+        }
+
+    try:
+        return Event.model_validate(raw_event), None
+    except ValidationError as e:
+        return None, {
+            "index": index,
+            "event_id": raw_event.get("event_id"),
+            "error": e.errors(),
+        }
+
+
+def _determine_ingest_status(
+    received_count: int,
+    processed_count: int,
+    duplicate_count: int,
+    error_count: int,
+) -> str:
+    """
+    Compute a clear batch status for reviewer/debugging visibility.
+    """
+
+    if received_count == 0:
+        return "failed"
+
+    if processed_count == received_count and duplicate_count == 0 and error_count == 0:
+        return "success"
+
+    if processed_count == 0 and duplicate_count == received_count and error_count == 0:
+        return "duplicate_only"
+
+    if processed_count == 0 and duplicate_count == 0 and error_count > 0:
+        return "failed"
+
+    return "partial_success"
+
+
 @app.post(
     "/events/ingest",
     response_model=EventIngestResponse,
     status_code=status.HTTP_202_ACCEPTED,
     tags=["Ingestion"],
 )
-async def ingest_events(payload: EventIngestRequest, db: Session = Depends(get_db)):
+async def ingest_events(
+    payload: Any = Body(...),
+    db: Session = Depends(get_db),
+):
     """
     Ingest a batch of CV-generated events.
 
-    Current behavior:
-    - Validates event payloads through Pydantic.
-    - Inserts raw event records with event_id idempotency.
-    - Updates the materialized VisitorSession table.
-    - Triggers POS correlation on BILLING_QUEUE_EXIT.
+    Milestone 4 behavior:
+    - Accepts the raw event batch envelope.
+    - Validates each event independently.
+    - Inserts valid events.
+    - Skips duplicate event_ids idempotently.
+    - Returns structured success/partial_success results.
     """
 
+    raw_events, envelope_errors = _validate_payload_shape(payload)
+
+    if raw_events is None:
+        return EventIngestResponse(
+            status="failed",
+            received_count=0,
+            processed_count=0,
+            duplicate_count=0,
+            error_count=len(envelope_errors),
+            errors=envelope_errors,
+        )
+
+    received_count = len(raw_events)
     processed_count = 0
-    errors = []
+    duplicate_count = 0
+    errors: List[dict] = []
 
-    for event_in in payload.events:
+    for index, raw_event in enumerate(raw_events):
+        event_in, validation_error = _validate_raw_event(raw_event, index)
+
+        if validation_error is not None:
+            errors.append(validation_error)
+            continue
+
         db_event = _create_event_record(event_in)
-
         db.add(db_event)
 
         try:
             db.commit()
             processed_count += 1
         except IntegrityError:
-            # Duplicate event_id: idempotent skip.
             db.rollback()
+            duplicate_count += 1
+            continue
+        except Exception as e:
+            db.rollback()
+            logger.error(
+                "Failed to persist event at index %s: %s",
+                index,
+                e,
+            )
+            errors.append(
+                {
+                    "index": index,
+                    "event_id": str(event_in.event_id),
+                    "error": str(e),
+                }
+            )
             continue
 
         event_type = event_in.event_type.value
@@ -213,14 +358,27 @@ async def ingest_events(payload: EventIngestRequest, db: Session = Depends(get_d
             )
             errors.append(
                 {
+                    "index": index,
                     "event_id": str(event_in.event_id),
                     "error": str(e),
                 }
             )
 
-    return EventIngestResponse(
-        status="success" if not errors else "partial_success",
+    error_count = len(errors)
+
+    response_status = _determine_ingest_status(
+        received_count=received_count,
         processed_count=processed_count,
+        duplicate_count=duplicate_count,
+        error_count=error_count,
+    )
+
+    return EventIngestResponse(
+        status=response_status,
+        received_count=received_count,
+        processed_count=processed_count,
+        duplicate_count=duplicate_count,
+        error_count=error_count,
         errors=errors if errors else None,
     )
 

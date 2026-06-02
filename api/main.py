@@ -25,17 +25,15 @@ logger = logging.getLogger(__name__)
 
 STALE_FEED_THRESHOLD_MINUTES = 10
 
+EXCLUDED_HEATMAP_ZONES = {
+    "ENTRY_DOOR",
+    "BILLING_QUEUE",
+    "BEHIND_COUNTER",
+}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Application startup lifecycle.
-
-    Seeds POS data from the mounted /app/data directory before normal use.
-    If seeding fails, the API still starts so that health checks and basic
-    API inspection do not crash.
-    """
-
     logger.info("Initializing Store API...")
 
     try:
@@ -57,13 +55,6 @@ app = FastAPI(
 # ---------------------------------------------------------------------
 
 def _normalize_datetime_to_utc(value) -> Optional[datetime]:
-    """
-    Convert a database timestamp into a UTC-aware datetime.
-
-    SQLite/SQLAlchemy may return timezone-naive datetimes. This helper
-    keeps health and metrics endpoints robust.
-    """
-
     if value is None:
         return None
 
@@ -93,10 +84,6 @@ def _datetime_to_iso(value) -> Optional[str]:
 # ---------------------------------------------------------------------
 
 def _check_database_health(db: Session) -> dict:
-    """
-    Run a lightweight database connectivity check.
-    """
-
     try:
         db.execute(text("SELECT 1"))
         return {"status": "connected"}
@@ -109,10 +96,6 @@ def _check_database_health(db: Session) -> dict:
 
 
 def _get_latest_event_by_store(db: Session) -> list:
-    """
-    Return latest event timestamp per store.
-    """
-
     return (
         db.query(
             EventRecord.store_id,
@@ -125,10 +108,6 @@ def _get_latest_event_by_store(db: Session) -> list:
 
 
 def _get_feed_status(last_event_time: Optional[datetime]) -> tuple[str, list]:
-    """
-    Determine whether a store feed is active, stale, or has no events.
-    """
-
     if last_event_time is None:
         return "NO_EVENTS", ["NO_EVENTS_RECEIVED"]
 
@@ -143,16 +122,6 @@ def _get_feed_status(last_event_time: Optional[datetime]) -> tuple[str, list]:
 
 @app.get("/health", tags=["System"])
 async def health_check(db: Session = Depends(get_db)):
-    """
-    Operational health endpoint.
-
-    Reports:
-    - API status
-    - database connectivity
-    - latest event timestamp per store
-    - stale-feed warnings
-    """
-
     database_status = _check_database_health(db)
 
     if database_status.get("status") != "connected":
@@ -212,12 +181,6 @@ async def health_check(db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------
 
 def _create_event_record(event_in: Event) -> EventRecord:
-    """
-    Convert a validated Pydantic event into a SQLAlchemy EventRecord.
-
-    Persists full Event Schema v1.2 fields including flattened metadata.
-    """
-
     metadata = event_in.metadata
 
     return EventRecord(
@@ -246,10 +209,6 @@ def _get_session(db: Session, visitor_id: str) -> Optional[VisitorSession]:
 
 
 def _create_or_update_entry_session(db: Session, event_in: Event) -> VisitorSession:
-    """
-    Create or update a visitor session from an ENTRY event.
-    """
-
     session = _get_session(db, event_in.visitor_id)
 
     if session is None:
@@ -278,13 +237,6 @@ def _update_existing_session_from_event(
     db: Session,
     event_in: Event,
 ) -> Optional[VisitorSession]:
-    """
-    Update derived session state using non-ENTRY events.
-
-    This function does not create sessions for every zone event. The
-    top-of-funnel session still starts from ENTRY.
-    """
-
     session = _get_session(db, event_in.visitor_id)
 
     if session is None:
@@ -307,10 +259,6 @@ def _update_existing_session_from_event(
 
 
 def _validate_payload_shape(payload: Any) -> tuple[Optional[List[dict]], List[dict]]:
-    """
-    Validate only the outer batch envelope.
-    """
-
     if not isinstance(payload, dict):
         return None, [
             {
@@ -353,10 +301,6 @@ def _validate_payload_shape(payload: Any) -> tuple[Optional[List[dict]], List[di
 
 
 def _validate_raw_event(raw_event: Any, index: int) -> tuple[Optional[Event], Optional[dict]]:
-    """
-    Validate a single raw event dictionary with Pydantic.
-    """
-
     if not isinstance(raw_event, dict):
         return None, {
             "index": index,
@@ -380,10 +324,6 @@ def _determine_ingest_status(
     duplicate_count: int,
     error_count: int,
 ) -> str:
-    """
-    Compute a clear batch status for reviewer/debugging visibility.
-    """
-
     if received_count == 0:
         return "failed"
 
@@ -409,17 +349,6 @@ async def ingest_events(
     payload: Any = Body(...),
     db: Session = Depends(get_db),
 ):
-    """
-    Ingest a batch of CV-generated events.
-
-    Behavior:
-    - Accepts the raw event batch envelope.
-    - Validates each event independently.
-    - Inserts valid events.
-    - Skips duplicate event_ids idempotently.
-    - Returns structured success/partial_success results.
-    """
-
     raw_events, envelope_errors = _validate_payload_shape(payload)
 
     if raw_events is None:
@@ -456,11 +385,7 @@ async def ingest_events(
             continue
         except Exception as e:
             db.rollback()
-            logger.error(
-                "Failed to persist event at index %s: %s",
-                index,
-                e,
-            )
+            logger.error("Failed to persist event at index %s: %s", index, e)
             errors.append(
                 {
                     "index": index,
@@ -528,19 +453,6 @@ async def ingest_events(
 # ---------------------------------------------------------------------
 
 def _compute_current_queue_depth(db: Session, store_id: str) -> int:
-    """
-    Compute current billing queue depth from the latest queue event per visitor.
-
-    Logic:
-    - Query BILLING_QUEUE_JOIN and BILLING_QUEUE_EXIT events.
-    - Keep the latest queue event per visitor.
-    - Count visitors whose latest queue event is JOIN.
-
-    This is event-derived and does not depend on VisitorSession, because
-    billing-camera visitor IDs may not always match entrance-camera sessions
-    until full Re-ID is implemented.
-    """
-
     queue_events = (
         db.query(
             EventRecord.visitor_id,
@@ -575,12 +487,6 @@ def _compute_current_queue_depth(db: Session, store_id: str) -> int:
 
 
 def _compute_avg_dwell_by_zone(db: Session, store_id: str) -> dict:
-    """
-    Compute average dwell time in milliseconds by zone.
-
-    Uses ZONE_DWELL events generated by the CV state machine.
-    """
-
     rows = (
         db.query(
             EventRecord.zone_id,
@@ -625,26 +531,120 @@ def _get_latest_event_timestamp(db: Session, store_id: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------
+# Heatmap helpers
+# ---------------------------------------------------------------------
+
+def _is_heatmap_zone(zone_name: Optional[str]) -> bool:
+    if zone_name is None:
+        return False
+
+    return zone_name not in EXCLUDED_HEATMAP_ZONES
+
+
+def _get_zone_visit_counts(db: Session, store_id: str) -> dict:
+    rows = (
+        db.query(
+            EventRecord.zone_id,
+            EventRecord.sku_zone,
+            func.count(EventRecord.event_id).label("visit_count"),
+        )
+        .filter(
+            EventRecord.store_id == store_id,
+            EventRecord.event_type == "ZONE_ENTER",
+            EventRecord.is_staff == False,
+        )
+        .group_by(EventRecord.zone_id, EventRecord.sku_zone)
+        .all()
+    )
+
+    visit_counts = {}
+
+    for row in rows:
+        zone_key = row.zone_id or row.sku_zone
+
+        if not _is_heatmap_zone(zone_key):
+            continue
+
+        visit_counts[zone_key] = int(row.visit_count or 0)
+
+    return visit_counts
+
+
+def _get_zone_avg_dwell(db: Session, store_id: str) -> dict:
+    rows = (
+        db.query(
+            EventRecord.zone_id,
+            EventRecord.sku_zone,
+            func.avg(EventRecord.dwell_ms).label("avg_dwell_ms"),
+        )
+        .filter(
+            EventRecord.store_id == store_id,
+            EventRecord.event_type == "ZONE_DWELL",
+            EventRecord.dwell_ms.isnot(None),
+            EventRecord.is_staff == False,
+        )
+        .group_by(EventRecord.zone_id, EventRecord.sku_zone)
+        .all()
+    )
+
+    avg_dwell = {}
+
+    for row in rows:
+        zone_key = row.zone_id or row.sku_zone
+
+        if not _is_heatmap_zone(zone_key):
+            continue
+
+        avg_dwell[zone_key] = round(float(row.avg_dwell_ms or 0.0), 2)
+
+    return avg_dwell
+
+
+def _compute_heat_score(
+    visit_count: int,
+    avg_dwell_ms: float,
+    max_visit_count: int,
+    max_avg_dwell_ms: float,
+) -> float:
+    if max_visit_count <= 0 and max_avg_dwell_ms <= 0:
+        return 0.0
+
+    visit_component = (
+        visit_count / max_visit_count
+        if max_visit_count > 0
+        else 0.0
+    )
+
+    dwell_component = (
+        avg_dwell_ms / max_avg_dwell_ms
+        if max_avg_dwell_ms > 0
+        else 0.0
+    )
+
+    heat_score = (0.6 * visit_component + 0.4 * dwell_component) * 100
+
+    return round(min(max(heat_score, 0.0), 100.0), 2)
+
+
+def _get_heatmap_data_confidence(total_zone_visits: int) -> str:
+    if total_zone_visits == 0:
+        return "NO_DATA"
+
+    if total_zone_visits < 10:
+        return "LOW"
+
+    if total_zone_visits <= 50:
+        return "MEDIUM"
+
+    return "HIGH"
+
+
+# ---------------------------------------------------------------------
 # Analytics endpoints
 # ---------------------------------------------------------------------
 
 @app.get("/stores/{store_id}/metrics", tags=["Analytics"])
 async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
-    """
-    Returns real-time store metrics.
-
-    Backward-compatible fields:
-    - total_visitors
-    - converted_visitors
-    - conversion_rate_percentage
-
-    Milestone 6 added:
-    - current_queue_depth
-    - avg_dwell_ms_by_zone
-    - total_events
-    - last_event_timestamp
-    """
-
     total_visitors = (
         db.query(VisitorSession)
         .filter(
@@ -687,15 +687,53 @@ async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
     }
 
 
+@app.get("/stores/{store_id}/heatmap", tags=["Analytics"])
+async def get_store_heatmap(store_id: str, db: Session = Depends(get_db)):
+    visit_counts = _get_zone_visit_counts(db, store_id)
+    avg_dwell = _get_zone_avg_dwell(db, store_id)
+
+    all_zones = sorted(set(visit_counts.keys()) | set(avg_dwell.keys()))
+
+    total_zone_visits = sum(visit_counts.values())
+    data_confidence = _get_heatmap_data_confidence(total_zone_visits)
+
+    max_visit_count = max(visit_counts.values()) if visit_counts else 0
+    max_avg_dwell_ms = max(avg_dwell.values()) if avg_dwell else 0.0
+
+    zones = []
+
+    for zone_id in all_zones:
+        visit_count = visit_counts.get(zone_id, 0)
+        avg_dwell_ms = avg_dwell.get(zone_id, 0.0)
+
+        heat_score = _compute_heat_score(
+            visit_count=visit_count,
+            avg_dwell_ms=avg_dwell_ms,
+            max_visit_count=max_visit_count,
+            max_avg_dwell_ms=max_avg_dwell_ms,
+        )
+
+        zones.append(
+            {
+                "zone_id": zone_id,
+                "visit_count": visit_count,
+                "avg_dwell_ms": avg_dwell_ms,
+                "heat_score": heat_score,
+            }
+        )
+
+    zones.sort(key=lambda item: item["heat_score"], reverse=True)
+
+    return {
+        "store_id": store_id,
+        "heatmap_type": "zone_level",
+        "data_confidence": data_confidence,
+        "zones": zones,
+    }
+
+
 @app.get("/stores/{store_id}/funnel", tags=["Analytics"])
 async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
-    """
-    Returns a basic shopper funnel.
-
-    Current funnel:
-    Entry -> Billing Queue -> Purchase
-    """
-
     entered_store = (
         db.query(VisitorSession)
         .filter(

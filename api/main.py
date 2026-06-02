@@ -1,7 +1,9 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
+from datetime import datetime, timezone, timedelta
 
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, text
 from fastapi import FastAPI, status, Depends, Body
 import logging
 from contextlib import asynccontextmanager
@@ -19,6 +21,9 @@ from seed_data import seed_pos_data
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+STALE_FEED_THRESHOLD_MINUTES = 10
 
 
 @asynccontextmanager
@@ -47,17 +52,157 @@ app = FastAPI(
 )
 
 
+# ---------------------------------------------------------------------
+# Health helpers
+# ---------------------------------------------------------------------
+
+def _normalize_datetime_to_utc(value) -> Optional[datetime]:
+    """
+    Convert a database timestamp into a UTC-aware datetime.
+
+    SQLite/SQLAlchemy may return either timezone-naive datetimes or strings
+    depending on how data was inserted and serialized. This helper keeps the
+    health endpoint robust.
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        try:
+            # Handles strings ending with Z as UTC.
+            value = value.replace("Z", "+00:00")
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    if not isinstance(value, datetime):
+        return None
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
+
+
+def _check_database_health(db: Session) -> dict:
+    """
+    Run a lightweight database connectivity check.
+    """
+
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "connected"}
+    except Exception as e:
+        logger.error("Database health check failed: %s", e)
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+def _get_latest_event_by_store(db: Session) -> list:
+    """
+    Return latest event timestamp per store.
+    """
+
+    return (
+        db.query(
+            EventRecord.store_id,
+            func.max(EventRecord.timestamp).label("last_event_timestamp"),
+        )
+        .filter(EventRecord.store_id.isnot(None))
+        .group_by(EventRecord.store_id)
+        .all()
+    )
+
+
+def _get_feed_status(last_event_time: Optional[datetime]) -> tuple[str, list]:
+    """
+    Determine whether a store feed is active, stale, or has no events.
+    """
+
+    if last_event_time is None:
+        return "NO_EVENTS", ["NO_EVENTS_RECEIVED"]
+
+    now_utc = datetime.now(timezone.utc)
+    age = now_utc - last_event_time
+
+    if age > timedelta(minutes=STALE_FEED_THRESHOLD_MINUTES):
+        return "STALE", ["STALE_FEED"]
+
+    return "OK", []
+
+
 @app.get("/health", tags=["System"])
-async def health_check():
+async def health_check(db: Session = Depends(get_db)):
     """
-    Basic health endpoint.
+    Operational health endpoint.
 
-    Milestone 5 will upgrade this to include last event timestamp and
-    stale feed status.
+    Reports:
+    - API status
+    - database connectivity
+    - latest event timestamp per store
+    - stale-feed warnings
     """
 
-    return {"status": "healthy"}
+    database_status = _check_database_health(db)
 
+    if database_status.get("status") != "connected":
+        return {
+            "status": "degraded",
+            "database": database_status,
+            "stores": {},
+            "warnings": ["DATABASE_UNAVAILABLE"],
+        }
+
+    try:
+        latest_events = _get_latest_event_by_store(db)
+    except Exception as e:
+        logger.error("Failed to query latest events: %s", e)
+        return {
+            "status": "degraded",
+            "database": database_status,
+            "stores": {},
+            "warnings": ["EVENT_QUERY_FAILED"],
+        }
+
+    stores = {}
+    global_warnings = []
+
+    if not latest_events:
+        global_warnings.append("NO_EVENTS_RECEIVED")
+
+    for row in latest_events:
+        store_id = row.store_id
+        last_event_time = _normalize_datetime_to_utc(row.last_event_timestamp)
+
+        feed_status, warnings = _get_feed_status(last_event_time)
+
+        stores[store_id] = {
+            "last_event_timestamp": last_event_time.isoformat()
+            if last_event_time is not None
+            else None,
+            "feed_status": feed_status,
+            "warnings": warnings,
+        }
+
+    overall_status = "healthy"
+
+    if any(store["feed_status"] == "STALE" for store in stores.values()):
+        overall_status = "degraded"
+
+    return {
+        "status": overall_status,
+        "database": database_status,
+        "stores": stores,
+        "warnings": global_warnings,
+    }
+
+
+# ---------------------------------------------------------------------
+# Ingestion helpers
+# ---------------------------------------------------------------------
 
 def _create_event_record(event_in: Event) -> EventRecord:
     """
@@ -272,7 +417,7 @@ async def ingest_events(
     """
     Ingest a batch of CV-generated events.
 
-    Milestone 4 behavior:
+    Behavior:
     - Accepts the raw event batch envelope.
     - Validates each event independently.
     - Inserts valid events.
@@ -382,6 +527,10 @@ async def ingest_events(
         errors=errors if errors else None,
     )
 
+
+# ---------------------------------------------------------------------
+# Analytics endpoints
+# ---------------------------------------------------------------------
 
 @app.get("/stores/{store_id}/metrics", tags=["Analytics"])
 async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):

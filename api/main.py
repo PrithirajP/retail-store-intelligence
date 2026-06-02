@@ -31,6 +31,21 @@ EXCLUDED_HEATMAP_ZONES = {
     "BEHIND_COUNTER",
 }
 
+EXPECTED_PRODUCT_ZONES = {
+    "MAKEUP",
+    "SKINCARE",
+}
+
+QUEUE_SPIKE_WARN_THRESHOLD = 5
+QUEUE_SPIKE_CRITICAL_THRESHOLD = 8
+
+BASELINE_CONVERSION_RATE_PERCENTAGE = 25.0
+CONVERSION_DROP_WARN_FACTOR = 0.70
+CONVERSION_DROP_CRITICAL_FACTOR = 0.50
+MIN_VISITORS_FOR_CONVERSION_ANOMALY = 5
+
+DEAD_ZONE_MIN_TOTAL_EVENTS = 20
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -550,13 +565,6 @@ def _get_latest_event_timestamp(db: Session, store_id: str) -> Optional[str]:
 # ---------------------------------------------------------------------
 
 def _get_queue_events(db: Session, store_id: str) -> list:
-    """
-    Fetch billing queue join/exit events from the raw event stream.
-
-    This avoids relying entirely on VisitorSession because global Re-ID is not
-    implemented yet, and billing-camera visitor IDs may not match entrance IDs.
-    """
-
     return (
         db.query(
             EventRecord.visitor_id,
@@ -580,15 +588,6 @@ def _get_queue_events(db: Session, store_id: str) -> list:
 
 
 def _get_queue_cycles(db: Session, store_id: str) -> dict:
-    """
-    Build queue cycles from BILLING_QUEUE_JOIN and BILLING_QUEUE_EXIT events.
-
-    For each visitor:
-    - JOIN starts an open cycle.
-    - EXIT closes the latest open cycle.
-    - JOIN without EXIT contributes to current_queue_depth.
-    """
-
     queue_events = _get_queue_events(db, store_id)
 
     open_join_by_visitor = {}
@@ -602,7 +601,6 @@ def _get_queue_cycles(db: Session, store_id: str) -> dict:
         if event_type == "BILLING_QUEUE_JOIN":
             joined_visitors.add(visitor_id)
 
-            # If repeated JOIN occurs before EXIT, keep the earliest open join.
             if visitor_id not in open_join_by_visitor:
                 open_join_by_visitor[visitor_id] = event.timestamp
 
@@ -610,7 +608,6 @@ def _get_queue_cycles(db: Session, store_id: str) -> dict:
             join_time = open_join_by_visitor.pop(visitor_id, None)
 
             if join_time is None:
-                # EXIT without JOIN is ignored for wait-time calculation.
                 continue
 
             wait_ms = _milliseconds_between(join_time, event.timestamp)
@@ -770,11 +767,41 @@ def _get_heatmap_data_confidence(total_zone_visits: int) -> str:
 
 
 # ---------------------------------------------------------------------
-# Analytics endpoints
+# Anomaly helpers
 # ---------------------------------------------------------------------
 
-@app.get("/stores/{store_id}/metrics", tags=["Analytics"])
-async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
+def _build_anomaly(
+    anomaly_type: str,
+    severity: str,
+    message: str,
+    suggested_action: str,
+    evidence: dict,
+) -> dict:
+    return {
+        "type": anomaly_type,
+        "severity": severity,
+        "message": message,
+        "suggested_action": suggested_action,
+        "evidence": evidence,
+    }
+
+
+def _rollup_anomaly_status(anomalies: list) -> str:
+    severities = {anomaly["severity"] for anomaly in anomalies}
+
+    if "CRITICAL" in severities:
+        return "CRITICAL"
+
+    if "WARN" in severities:
+        return "WARN"
+
+    if "INFO" in severities:
+        return "INFO"
+
+    return "OK"
+
+
+def _get_conversion_stats(db: Session, store_id: str) -> dict:
     total_visitors = (
         db.query(VisitorSession)
         .filter(
@@ -800,6 +827,170 @@ async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
         else 0.0
     )
 
+    return {
+        "total_visitors": total_visitors,
+        "converted_visitors": converted_visitors,
+        "conversion_rate_percentage": round(conversion_rate, 2),
+    }
+
+
+def _detect_queue_spike(db: Session, store_id: str) -> Optional[dict]:
+    queue_summary = _compute_queue_summary(db, store_id)
+    current_depth = queue_summary["current_queue_depth"]
+
+    if current_depth >= QUEUE_SPIKE_CRITICAL_THRESHOLD:
+        return _build_anomaly(
+            anomaly_type="BILLING_QUEUE_SPIKE",
+            severity="CRITICAL",
+            message=f"Current billing queue depth is {current_depth}, above the critical threshold.",
+            suggested_action="Immediately open additional billing counters and assign staff support.",
+            evidence={
+                "current_queue_depth": current_depth,
+                "warn_threshold": QUEUE_SPIKE_WARN_THRESHOLD,
+                "critical_threshold": QUEUE_SPIKE_CRITICAL_THRESHOLD,
+            },
+        )
+
+    if current_depth >= QUEUE_SPIKE_WARN_THRESHOLD:
+        return _build_anomaly(
+            anomaly_type="BILLING_QUEUE_SPIKE",
+            severity="WARN",
+            message=f"Current billing queue depth is {current_depth}.",
+            suggested_action="Open an additional billing counter or assign staff to checkout.",
+            evidence={
+                "current_queue_depth": current_depth,
+                "warn_threshold": QUEUE_SPIKE_WARN_THRESHOLD,
+                "critical_threshold": QUEUE_SPIKE_CRITICAL_THRESHOLD,
+            },
+        )
+
+    return None
+
+
+def _detect_conversion_drop(db: Session, store_id: str) -> Optional[dict]:
+    stats = _get_conversion_stats(db, store_id)
+
+    total_visitors = stats["total_visitors"]
+    current_rate = stats["conversion_rate_percentage"]
+
+    if total_visitors < MIN_VISITORS_FOR_CONVERSION_ANOMALY:
+        return None
+
+    critical_threshold = (
+        BASELINE_CONVERSION_RATE_PERCENTAGE * CONVERSION_DROP_CRITICAL_FACTOR
+    )
+    warn_threshold = (
+        BASELINE_CONVERSION_RATE_PERCENTAGE * CONVERSION_DROP_WARN_FACTOR
+    )
+
+    if current_rate < critical_threshold:
+        return _build_anomaly(
+            anomaly_type="CONVERSION_DROP",
+            severity="CRITICAL",
+            message=(
+                f"Conversion rate is {current_rate}%, significantly below "
+                f"the baseline of {BASELINE_CONVERSION_RATE_PERCENTAGE}%."
+            ),
+            suggested_action="Investigate billing flow, queue abandonment, and staff availability immediately.",
+            evidence={
+                "current_conversion_rate_percentage": current_rate,
+                "baseline_conversion_rate_percentage": BASELINE_CONVERSION_RATE_PERCENTAGE,
+                "critical_threshold_percentage": round(critical_threshold, 2),
+                "warn_threshold_percentage": round(warn_threshold, 2),
+                "total_visitors": total_visitors,
+            },
+        )
+
+    if current_rate < warn_threshold:
+        return _build_anomaly(
+            anomaly_type="CONVERSION_DROP",
+            severity="WARN",
+            message=(
+                f"Conversion rate is {current_rate}%, below "
+                f"the expected baseline of {BASELINE_CONVERSION_RATE_PERCENTAGE}%."
+            ),
+            suggested_action="Review queue wait time, checkout staffing, and shopper assistance coverage.",
+            evidence={
+                "current_conversion_rate_percentage": current_rate,
+                "baseline_conversion_rate_percentage": BASELINE_CONVERSION_RATE_PERCENTAGE,
+                "critical_threshold_percentage": round(critical_threshold, 2),
+                "warn_threshold_percentage": round(warn_threshold, 2),
+                "total_visitors": total_visitors,
+            },
+        )
+
+    return None
+
+
+def _detect_dead_zones(db: Session, store_id: str) -> list:
+    total_events = _get_total_event_count(db, store_id)
+
+    if total_events < DEAD_ZONE_MIN_TOTAL_EVENTS:
+        return []
+
+    visit_counts = _get_zone_visit_counts(db, store_id)
+    anomalies = []
+
+    for zone_id in sorted(EXPECTED_PRODUCT_ZONES):
+        if visit_counts.get(zone_id, 0) == 0:
+            anomalies.append(
+                _build_anomaly(
+                    anomaly_type="DEAD_ZONE",
+                    severity="WARN",
+                    message=f"No customer visits detected in {zone_id}.",
+                    suggested_action=(
+                        "Check camera calibration, product-zone placement, "
+                        "or whether the zone is being physically blocked."
+                    ),
+                    evidence={
+                        "zone_id": zone_id,
+                        "visit_count": 0,
+                        "total_events": total_events,
+                        "minimum_events_required": DEAD_ZONE_MIN_TOTAL_EVENTS,
+                    },
+                )
+            )
+
+    return anomalies
+
+
+def _detect_stale_feed(db: Session, store_id: str) -> Optional[dict]:
+    latest_timestamp = (
+        db.query(func.max(EventRecord.timestamp))
+        .filter(EventRecord.store_id == store_id)
+        .scalar()
+    )
+
+    latest_dt = _normalize_datetime_to_utc(latest_timestamp)
+
+    if latest_dt is None:
+        return None
+
+    feed_status, warnings = _get_feed_status(latest_dt)
+
+    if feed_status != "STALE":
+        return None
+
+    return _build_anomaly(
+        anomaly_type="STALE_FEED",
+        severity="WARN",
+        message="No recent CV events have been received for this store.",
+        suggested_action="Check camera stream, edge worker process, and network connectivity.",
+        evidence={
+            "last_event_timestamp": latest_dt.isoformat(),
+            "stale_threshold_minutes": STALE_FEED_THRESHOLD_MINUTES,
+            "warnings": warnings,
+        },
+    )
+
+
+# ---------------------------------------------------------------------
+# Analytics endpoints
+# ---------------------------------------------------------------------
+
+@app.get("/stores/{store_id}/metrics", tags=["Analytics"])
+async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
+    stats = _get_conversion_stats(db, store_id)
     queue_summary = _compute_queue_summary(db, store_id)
 
     avg_dwell_ms_by_zone = _compute_avg_dwell_by_zone(db, store_id)
@@ -808,9 +999,9 @@ async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
 
     return {
         "store_id": store_id,
-        "total_visitors": total_visitors,
-        "converted_visitors": converted_visitors,
-        "conversion_rate_percentage": round(conversion_rate, 2),
+        "total_visitors": stats["total_visitors"],
+        "converted_visitors": stats["converted_visitors"],
+        "conversion_rate_percentage": stats["conversion_rate_percentage"],
         "current_queue_depth": queue_summary["current_queue_depth"],
         "avg_queue_wait_ms": queue_summary["avg_queue_wait_ms"],
         "avg_dwell_ms_by_zone": avg_dwell_ms_by_zone,
@@ -866,15 +1057,6 @@ async def get_store_heatmap(store_id: str, db: Session = Depends(get_db)):
 
 @app.get("/stores/{store_id}/funnel", tags=["Analytics"])
 async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
-    """
-    Returns shopper funnel metrics.
-
-    Queue analytics are now derived from raw BILLING_QUEUE_JOIN/EXIT events.
-    This is intentional because global cross-camera Re-ID is not fully
-    implemented yet, so raw billing queue participation is more reliable
-    than relying only on VisitorSession.billing_exit_time.
-    """
-
     entered_store = (
         db.query(VisitorSession)
         .filter(
@@ -922,4 +1104,29 @@ async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
             "current_queue_depth": queue_summary["current_queue_depth"],
             "queue_data_source": queue_summary["queue_data_source"],
         },
+    }
+
+
+@app.get("/stores/{store_id}/anomalies", tags=["Analytics"])
+async def get_store_anomalies(store_id: str, db: Session = Depends(get_db)):
+    anomalies = []
+
+    queue_spike = _detect_queue_spike(db, store_id)
+    if queue_spike is not None:
+        anomalies.append(queue_spike)
+
+    conversion_drop = _detect_conversion_drop(db, store_id)
+    if conversion_drop is not None:
+        anomalies.append(conversion_drop)
+
+    anomalies.extend(_detect_dead_zones(db, store_id))
+
+    stale_feed = _detect_stale_feed(db, store_id)
+    if stale_feed is not None:
+        anomalies.append(stale_feed)
+
+    return {
+        "store_id": store_id,
+        "status": _rollup_anomaly_status(anomalies),
+        "anomalies": anomalies,
     }

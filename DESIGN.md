@@ -1,221 +1,969 @@
-# DESIGN.md — Store Intelligence Platform
+# DESIGN.md
 
-## 1. Architecture Overview
+# Retail Store Intelligence Platform — System Design
 
-This project implements a store intelligence pipeline that converts CCTV footage into business metrics for retail operations. The current system has three main layers:
+## 1. Purpose
+
+This project converts CCTV footage and POS transaction data into store-level retail intelligence.
+
+The system is designed to answer business questions such as:
+
+- How many customers entered the store?
+- How many customers reached the billing queue?
+- How many converted into purchases?
+- What is the conversion rate?
+- Which product zones received attention?
+- How long did customers dwell in zones?
+- Is the billing queue becoming too long?
+- Are there operational anomalies?
+
+The implementation prioritizes:
+
+- Acceptance-gate reliability
+- Simple reviewer setup
+- Explainable engineering decisions
+- Business-relevant metrics
+- Clear separation between edge CV and cloud analytics
+
+---
+
+## 2. Final Implemented Architecture
 
 ```text
-Raw CCTV Videos
-    ↓
-CV Edge Pipeline
-YOLOv8n + ByteTrack + polygon zone engine
-    ↓
-Structured Events
-ENTRY, ZONE_ENTER, ZONE_EXIT, ZONE_DWELL, BILLING_QUEUE_JOIN, BILLING_QUEUE_EXIT
-    ↓
-FastAPI Backend
-Validation, idempotent ingestion, session materialization, POS correlation
-    ↓
-SQLite Database
-Raw events, visitor sessions, POS transactions
-    ↓
-Analytics API
-/metrics and /funnel
-    ↓
-Streamlit Dashboard
-Live conversion and funnel visualization
+CCTV video files
+   ↓
+cv_pipeline/orchestrator.py
+   ↓
+YOLOv8n person detection
+   ↓
+ByteTrack local tracking
+   ↓
+Polygon-based zone state machine
+   ↓
+Structured Event Schema v1.2
+   ↓
+FastAPI /events/ingest
+   ↓
+SQLite database
+   ↓
+Metrics / Funnel / Heatmap / Anomalies APIs
+   ↓
+Streamlit dashboard
 ```
 
-The North Star metric is offline store conversion rate:
+The system is split into two runtime layers:
+
+## 2.1 Cloud Layer
+
+The cloud layer is containerized with Docker Compose.
+
+Services:
 
 ```text
-converted visitors / total unique visitors
+store-api
+store-dashboard
 ```
 
-## 2. Edge/Cloud Split
+### `store-api`
 
-The current implementation separates the system into two operational layers:
+FastAPI backend responsible for:
 
-| Layer | Runtime | Components |
-|---|---|---|
-| Cloud/backend layer | Docker Compose | FastAPI API and Streamlit dashboard |
-| Edge CV layer | Host Python process | YOLOv8n, ByteTrack, polygon zone engine |
+- API health
+- Event ingestion
+- Event validation
+- Idempotent persistence
+- POS CSV seeding
+- Visitor session materialization
+- POS correlation
+- Metrics endpoint
+- Funnel endpoint
+- Heatmap endpoint
+- Anomaly endpoint
+- Structured request logging
 
-The API and dashboard are containerized to provide a reliable review path. The CV pipeline currently runs outside Docker because PyTorch, OpenCV, and Ultralytics introduce hardware-specific dependency risk inside containers, especially across macOS, Windows, and Linux machines.
+### `store-dashboard`
+
+Streamlit dashboard responsible for:
+
+- North Star KPIs
+- Queue KPIs
+- Funnel chart
+- Health status
+- Heatmap table/chart
+- Active anomaly panel
+
+## 2.2 Edge Layer
+
+The edge CV worker currently runs outside Docker:
+
+```bash
+cd cv_pipeline
+python orchestrator.py
+```
+
+This is deliberate. PyTorch, OpenCV, Ultralytics, and hardware acceleration can create Docker compatibility issues on reviewer machines. Running the CV worker locally improves the chance that the API and dashboard remain stable during evaluation.
+
+---
 
 ## 3. Computer Vision Pipeline
 
-Final CV entrypoint:
+## 3.1 Detection Model
+
+Implemented detector:
 
 ```text
+YOLOv8n
+```
+
+File:
+
+```text
+cv_pipeline/detector.py
+```
+
+Why YOLOv8n:
+
+- Lightweight
+- Fast on CPU compared with larger models
+- Easy integration through Ultralytics
+- Supports person-only detection
+- Works well enough for challenge-scale analytics
+
+The detector filters for the `person` class.
+
+## 3.2 Tracking Model
+
+Implemented tracker:
+
+```text
+ByteTrack
+```
+
+ByteTrack is used through the Ultralytics tracking interface.
+
+Purpose:
+
+- Maintain local identity within one camera
+- Reduce ID fragmentation during short occlusion
+- Avoid heavier Re-ID processing during every frame
+
+## 3.3 Identity Model
+
+Implemented:
+
+```text
+ByteTrack-local visitor IDs
+```
+
+Not implemented:
+
+```text
+Global cross-camera Re-ID
+OSNet / TorchReID
+REENTRY event generation
+```
+
+Current visitor IDs are local to the tracker. A person appearing in different cameras may receive different IDs.
+
+This limitation is documented and accepted for the current challenge version.
+
+Future design:
+
+```text
+YOLO crop → OSNet embedding → cosine similarity → global visitor ID
+```
+
+---
+
+## 4. Zone Detection Strategy
+
+Zone detection is polygon-based.
+
+Implemented files:
+
+```text
+cv_pipeline/zone_mapper.py
+cv_pipeline/tracker_state.py
 cv_pipeline/orchestrator.py
 ```
 
-Main modules:
+The zone mapper allows manual clicking of polygon points on a video frame. The generated arrays are pasted into `CAMERA_CONFIGS` inside `orchestrator.py`.
 
-| File | Responsibility |
-|---|---|
-| `detector.py` | Loads YOLOv8n and uses Ultralytics ByteTrack to return local person tracks |
-| `tracker_state.py` | Maintains zone dwell state, staff state, and queue transitions |
-| `event_emitter.py` | Buffers and posts event batches to FastAPI |
-| `zone_mapper.py` | Manual OpenCV polygon calibration utility |
-| `orchestrator.py` | Master loop for all configured cameras |
+Tracked point:
 
-### Detection
+```text
+bottom-center of bounding box
+```
 
-The detector uses YOLOv8n because it is fast enough for CPU execution and has simple Ultralytics integration.
+Reason:
 
-### Tracking
+The bottom-center point better represents the person’s physical floor location than the bounding-box center.
 
-The implementation uses ByteTrack through Ultralytics tracking. This gives local frame-to-frame identity continuity within a single camera feed.
+Zone logic uses:
 
-### Re-ID Status
+```python
+cv2.pointPolygonTest(...)
+```
 
-Cross-camera Re-ID and OSNet are not implemented in the current code. Visitor IDs are currently local ByteTrack IDs formatted as `VIS_<track_id>`.
+Implemented zone types:
 
-This means re-entry handling and cross-camera deduplication are known limitations.
+```text
+ENTRY_DOOR
+BILLING_QUEUE
+BEHIND_COUNTER
+MAKEUP
+SKINCARE
+```
 
-## 4. Zone Mapping
+---
 
-The project uses manual polygon calibration instead of parsing the provided layout file. `zone_mapper.py` opens the first frame of a video and lets the developer click polygon points. The printed `np.array(..., np.int32)` values are copied into `CAMERA_CONFIGS` inside `orchestrator.py`.
+## 5. Staff Detection Strategy
 
-Configured zones:
+Implemented staff detection:
 
-| Camera | Zones |
-|---|---|
-| `CAM_ENTRANCE` | `ENTRY_DOOR` |
-| `CAM_BILLING` | `BEHIND_COUNTER`, `BILLING_QUEUE` |
-| `CAM_MAKEUP` | `MAKEUP` |
-| `CAM_SKINCARE` | `SKINCARE` |
+```text
+Behind-counter spatial heuristic
+```
 
-The system uses the bottom-center point of the bounding box as the person’s floor position. This is more reliable than using the bounding-box center because CCTV perspective can make a person’s torso overlap a different zone from where they are actually standing.
+Rule:
 
-## 5. Staff Exclusion
+```text
+If a visitor stays inside BEHIND_COUNTER for more than 30 consecutive frames,
+mark that visitor as staff.
+```
 
-The current staff exclusion strategy is a behind-counter spatial heuristic.
+Staff events are excluded from customer-facing analytics.
 
-If a local visitor ID remains inside the `BEHIND_COUNTER` polygon for more than 30 consecutive frames, that visitor is added to a `staff_profiles` set and future events for that ID use `is_staff=True`.
+Strength:
 
-This handles cashier-like staff but does not fully handle roaming floor staff.
+- Very low compute overhead
+- Deterministic
+- Works well for cashiers
 
-## 6. Queue Logic
+Known limitation:
 
-The CV pipeline emits queue spatial facts:
+- Roaming staff in aisles may still be counted as customers.
+
+Future improvement:
+
+- Lightweight staff classifier for aisle staff
+- Uniform/lanyard classifier on cropped person images
+- Staff registry using appearance embeddings
+
+---
+
+## 6. Event Schema
+
+Implemented schema:
+
+```text
+Event Schema v1.2
+```
+
+The event payload preserves flattened fields and adds nested metadata.
+
+## 6.1 Core Event Fields
+
+```text
+event_id
+store_id
+camera_id
+visitor_id
+timestamp
+event_type
+zone_id
+dwell_ms
+is_staff
+confidence
+metadata
+```
+
+## 6.2 Metadata Fields
+
+```text
+metadata.queue_depth
+metadata.sku_zone
+metadata.session_seq
+```
+
+## 6.3 Supported Event Types
+
+```text
+ENTRY
+EXIT
+ZONE_ENTER
+ZONE_EXIT
+ZONE_DWELL
+BILLING_QUEUE_JOIN
+BILLING_QUEUE_EXIT
+REENTRY
+BILLING_QUEUE_ABANDON
+```
+
+Important distinction:
+
+- `REENTRY` is schema-supported but not currently emitted.
+- `BILLING_QUEUE_ABANDON` is schema-supported but not currently emitted as a raw CV event.
+- Queue abandonment is calculated in the API as an aggregate metric.
+
+---
+
+## 7. Event Generation
+
+Implemented in:
+
+```text
+cv_pipeline/tracker_state.py
+cv_pipeline/orchestrator.py
+```
+
+Generated event types:
+
+```text
+ENTRY
+ZONE_ENTER
+ZONE_EXIT
+ZONE_DWELL
+BILLING_QUEUE_JOIN
+BILLING_QUEUE_EXIT
+```
+
+`orchestrator.py` rewrites:
+
+```text
+ZONE_ENTER at ENTRY_DOOR → ENTRY
+```
+
+Event batching is handled by:
+
+```text
+cv_pipeline/event_emitter.py
+```
+
+The emitter sends batches to:
+
+```text
+POST http://127.0.0.1:8000/events/ingest
+```
+
+---
+
+## 8. API Design
+
+Implemented API framework:
+
+```text
+FastAPI
+```
+
+Implemented endpoints:
+
+```text
+GET  /health
+POST /events/ingest
+GET  /stores/{store_id}/metrics
+GET  /stores/{store_id}/funnel
+GET  /stores/{store_id}/heatmap
+GET  /stores/{store_id}/anomalies
+```
+
+## 8.1 Health Endpoint
+
+```text
+GET /health
+```
+
+Reports:
+
+- API status
+- Database status
+- Last event timestamp per store
+- Feed freshness
+- Stale-feed warnings
+
+## 8.2 Event Ingestion
+
+```text
+POST /events/ingest
+```
+
+Features:
+
+- Batch ingestion
+- Maximum 500 events per request
+- Per-event validation
+- Partial success handling
+- Duplicate event idempotency
+- Structured response counters
+
+Response includes:
+
+```text
+received_count
+processed_count
+duplicate_count
+error_count
+errors
+```
+
+## 8.3 Metrics Endpoint
+
+```text
+GET /stores/{store_id}/metrics
+```
+
+Returns:
+
+- Total visitors
+- Converted visitors
+- Conversion rate
+- Current queue depth
+- Average queue wait
+- Average dwell by zone
+- Total events
+- Last event timestamp
+
+## 8.4 Funnel Endpoint
+
+```text
+GET /stores/{store_id}/funnel
+```
+
+Returns:
+
+- Entered store
+- Entered billing queue
+- Completed purchase
+- Queue abandonment count
+- Queue abandonment rate
+- Average queue wait
+- Completed queue cycles
+- Current queue depth
+
+Queue metrics are computed from raw billing queue events rather than relying only on sessions.
+
+## 8.5 Heatmap Endpoint
+
+```text
+GET /stores/{store_id}/heatmap
+```
+
+Returns:
+
+- Zone visit counts
+- Average dwell per zone
+- Heat score
+- Data confidence
+
+Excluded zones:
+
+```text
+ENTRY_DOOR
+BILLING_QUEUE
+BEHIND_COUNTER
+```
+
+## 8.6 Anomalies Endpoint
+
+```text
+GET /stores/{store_id}/anomalies
+```
+
+Implemented anomaly types:
+
+```text
+BILLING_QUEUE_SPIKE
+CONVERSION_DROP
+DEAD_ZONE
+STALE_FEED
+```
+
+Each anomaly includes:
+
+```text
+type
+severity
+message
+suggested_action
+evidence
+```
+
+---
+
+## 9. Database Design
+
+Database:
+
+```text
+SQLite
+```
+
+ORM:
+
+```text
+SQLAlchemy
+```
+
+SQLite is used for simple challenge deployment.
+
+## 9.1 Tables
+
+### `events`
+
+Raw event ledger.
+
+Stores:
+
+```text
+event_id
+store_id
+camera_id
+visitor_id
+event_type
+timestamp
+zone_id
+dwell_ms
+is_staff
+confidence
+queue_depth
+sku_zone
+session_seq
+```
+
+### `sessions`
+
+Materialized visitor lifecycle table.
+
+Stores:
+
+```text
+visitor_id
+store_id
+entry_time
+last_seen_time
+billing_join_time
+billing_exit_time
+is_converted
+is_staff
+```
+
+### `pos_transactions`
+
+Seeded POS transaction table.
+
+Stores:
+
+```text
+transaction_id
+store_id
+timestamp
+basket_value_inr
+claimed_by_visitor_id
+```
+
+---
+
+## 10. POS Correlation
+
+Implemented in:
+
+```text
+api/database.py
+```
+
+When a visitor exits the billing queue, the API attempts to match that exit with a POS transaction.
+
+Rule:
+
+```text
+Find an unclaimed transaction from the same store within the 5-minute window before billing exit.
+```
+
+If matched:
+
+```text
+pos_transactions.claimed_by_visitor_id = visitor_id
+sessions.is_converted = True
+```
+
+This prevents double-counting the same transaction.
+
+Known limitation:
+
+Because full cross-camera Re-ID is not implemented, POS correlation is only as reliable as the visitor ID observed in the billing camera.
+
+---
+
+## 11. Queue Analytics
+
+Queue analytics are derived mainly from the raw event stream.
+
+Implemented queue events:
 
 ```text
 BILLING_QUEUE_JOIN
 BILLING_QUEUE_EXIT
 ```
 
-The backend derives conversion and abandonment from these events.
-
-When a `BILLING_QUEUE_EXIT` event is ingested, the API looks for an unclaimed POS transaction in the same store within the previous 5 minutes. If a transaction is found, the transaction is claimed and the visitor session is marked as converted.
-
-Queue abandonment is calculated in `/funnel` as:
+Queue cycle logic:
 
 ```text
-entered_billing_queue - completed_purchase
+JOIN starts queue cycle
+EXIT closes queue cycle
+JOIN without EXIT contributes to current_queue_depth
 ```
 
-## 7. Backend API
+Computed metrics:
+
+```text
+entered_billing_queue
+completed_queue_cycles
+current_queue_depth
+avg_queue_wait_ms
+queue_abandonment_count
+queue_abandonment_rate
+```
+
+Reason for event-derived queue logic:
+
+Since global cross-camera Re-ID is not implemented, raw billing queue events are more reliable for queue analytics than relying only on `VisitorSession`.
+
+---
+
+## 12. Heatmap Analytics
+
+Heatmap is zone-level, not pixel-level.
+
+Inputs:
+
+```text
+ZONE_ENTER
+ZONE_DWELL
+```
+
+Metrics:
+
+```text
+visit_count
+avg_dwell_ms
+heat_score
+```
+
+Heat score formula:
+
+```text
+heat_score = 0.6 * normalized_visit_count + 0.4 * normalized_avg_dwell
+```
+
+Returned score range:
+
+```text
+0 to 100
+```
+
+Data confidence:
+
+```text
+NO_DATA
+LOW
+MEDIUM
+HIGH
+```
+
+---
+
+## 13. Anomaly Detection
+
+Implemented anomaly detection is rule-based.
+
+No ML anomaly model is used.
+
+Reasons:
+
+- Faster to implement
+- Explainable
+- Deterministic
+- Easy to validate
+- Appropriate for challenge timeline
+
+Implemented rules:
+
+## 13.1 Billing Queue Spike
+
+```text
+WARN     if current_queue_depth >= 5
+CRITICAL if current_queue_depth >= 8
+```
+
+## 13.2 Conversion Drop
+
+Uses fallback baseline:
+
+```text
+BASELINE_CONVERSION_RATE_PERCENTAGE = 25.0
+```
+
+Rules:
+
+```text
+WARN     if current conversion < 70% of baseline
+CRITICAL if current conversion < 50% of baseline
+```
+
+Guard:
+
+```text
+Do not trigger if total visitors < 5
+```
+
+## 13.3 Dead Zone
+
+Expected zones:
+
+```text
+MAKEUP
+SKINCARE
+```
+
+Rule:
+
+```text
+If total event count > 20 and expected zone has 0 visits → WARN
+```
+
+## 13.4 Stale Feed
+
+Rule:
+
+```text
+If latest event is older than 10 minutes → WARN
+```
+
+---
+
+## 14. Dashboard Design
 
 Framework:
 
 ```text
-FastAPI + Pydantic + SQLAlchemy
+Streamlit
 ```
 
-Implemented endpoints:
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /health` | Basic liveness check |
-| `POST /events/ingest` | Batch ingest CV events |
-| `GET /stores/{store_id}/metrics` | Total visitors, conversions, conversion rate |
-| `GET /stores/{store_id}/funnel` | Entry → billing → purchase funnel |
-
-Missing endpoints:
+Implemented dashboard panels:
 
 ```text
-GET /stores/{store_id}/heatmap
-GET /stores/{store_id}/anomalies
+System Health
+North Star KPIs
+Queue and Event KPIs
+Shopper Funnel
+Queue Insights
+Active Anomalies
+Zone Heatmap
+Average Product-Zone Dwell
 ```
 
-## 8. Database Design
-
-Database:
+Dashboard calls:
 
 ```text
-SQLite using SQLAlchemy ORM
-```
-
-Tables:
-
-| Table | Purpose |
-|---|---|
-| `events` | Raw event ledger and idempotency by `event_id` |
-| `sessions` | Materialized visitor lifecycle state |
-| `pos_transactions` | Seeded POS transaction data |
-
-The `sessions` table allows the metrics and funnel endpoints to use fast count queries rather than reconstructing visitor journeys from raw events on every dashboard refresh.
-
-## 9. Dashboard Design
-
-The dashboard is implemented with Streamlit and Plotly.
-
-It polls:
-
-```text
+GET /health
 GET /stores/ST1008/metrics
 GET /stores/ST1008/funnel
+GET /stores/ST1008/heatmap
+GET /stores/ST1008/anomalies
 ```
 
-every 5 seconds and displays:
+Refresh method:
 
-- total unique visitors,
-- converted visitors,
-- conversion rate,
-- funnel chart,
-- queue abandonment count and rate.
+```text
+time.sleep(5)
+st.rerun()
+```
 
-## 10. AI-Assisted Decisions
+Known limitation:
 
-AI assistance was used to reason about implementation trade-offs and challenge priorities.
+Polling causes some UI flicker. A production system should use WebSockets or server-sent events.
 
-### Decision 1: YOLOv8n over heavier detectors
+---
 
-AI suggested multiple detector options including YOLO, Faster R-CNN, and MediaPipe. The final choice was YOLOv8n because the challenge required a runnable end-to-end system under time constraints, and YOLOv8n offered the best balance between speed, ecosystem maturity, and ease of integration with ByteTrack.
+## 15. Structured Logging
 
-### Decision 2: Edge/cloud split
+Implemented in:
 
-AI initially suggested full Docker containerization. The final decision was to containerize API and dashboard while running the CV pipeline on the host. This deviates from an ideal one-command setup but reduces hardware-specific failure modes from PyTorch/OpenCV/Ultralytics inside Docker.
+```text
+api/main.py
+```
 
-### Decision 3: Flattened event schema
+Every request logs a JSON-style structured record.
 
-AI suggested using the full nested challenge schema. The current implementation uses a flattened event schema to reduce integration risk and avoid Pydantic/SQLAlchemy serialization issues during the first working version. This is acknowledged as a compliance gap and planned for upgrade in the next milestone.
+Fields:
 
-## 11. Known Limitations
+```text
+trace_id
+method
+endpoint
+status_code
+latency_ms
+store_id
+client_host
+```
 
-- `README.md`, `DESIGN.md`, and `CHOICES.md` are added in this milestone, but tests are still missing.
-- Cross-camera Re-ID is not implemented.
-- `REENTRY` events are not generated.
-- `EXIT` events are not generated by the CV pipeline.
-- `/heatmap` is not implemented.
-- `/anomalies` is not implemented.
-- Event metadata is not fully challenge-compliant yet.
-- CV pipeline is not part of default Docker Compose.
-- Structured JSON logging is not implemented.
-- SQLite database is not persisted through a mounted volume.
+Every response includes:
 
-## 12. Production Evolution Path
+```text
+X-Trace-Id
+```
 
-The next engineering steps are:
+Ingestion additionally logs:
 
-1. Add challenge-compatible event metadata.
-2. Persist full event payload fields in SQLite.
-3. Implement `/heatmap`.
-4. Implement `/anomalies`.
-5. Upgrade `/health` with last event timestamp and stale-feed warnings.
-6. Add minimal pytest coverage and prompt blocks.
-7. Add optional Docker Compose profile for the CV worker.
-8. Add lightweight re-entry heuristic.
+```text
+received_count
+processed_count
+duplicate_count
+error_count
+status
+```
+
+No external logging dependency is used.
+
+---
+
+## 16. Testing Strategy
+
+Implemented tests:
+
+```text
+pytest
+FastAPI TestClient
+in-memory SQLite database
+```
+
+Test folder:
+
+```text
+tests/
+```
+
+Test coverage focus:
+
+- Health endpoint
+- Valid event ingestion
+- Duplicate event idempotency
+- Partial success for malformed events
+- Empty-state metrics
+- Empty-state funnel
+- Empty-state heatmap
+- Empty-state anomalies
+
+Current validation:
+
+```text
+8 passed
+```
+
+CV model tests are not implemented because YOLO/ByteTrack behavior depends on video files, model state, and local hardware.
+
+---
+
+## 17. Deployment Strategy
+
+Implemented Docker Compose services:
+
+```text
+store-api
+store-dashboard
+```
+
+Run:
+
+```bash
+docker compose up --build
+```
+
+Then run CV edge worker separately:
+
+```bash
+cd cv_pipeline
+python orchestrator.py
+```
+
+This split simulates an edge-cloud architecture.
+
+Known deployment limitation:
+
+The full system is not started by a single `docker compose up` command because the CV worker is outside Docker.
+
+---
+
+## 18. Implemented vs Planned
+
+## Implemented
+
+```text
+YOLOv8n detection
+ByteTrack local tracking
+Polygon zone detection
+Staff behind-counter heuristic
+Event Schema v1.2
+FastAPI ingestion
+Full event persistence
+SQLite database
+POS seeding
+POS correlation
+Metrics endpoint
+Funnel endpoint
+Heatmap endpoint
+Anomaly endpoint
+Health endpoint
+Structured logging
+Streamlit dashboard
+Minimal pytest suite
+```
+
+## Planned / Future
+
+```text
+OSNet / TorchReID global Re-ID
+REENTRY event generation
+Dedicated queue engine module
+PostgreSQL migration
+Alembic migrations
+Persistent edge buffer / DLQ
+Containerized CV worker
+Concurrent multi-camera processing
+WebSocket dashboard updates
+CV state-machine tests
+```
+
+---
+
+## 19. Known Limitations
+
+1. Full cross-camera Re-ID is not implemented.
+2. ByteTrack IDs are camera-local.
+3. `REENTRY` is schema-supported but not emitted.
+4. `BILLING_QUEUE_ABANDON` is aggregate-derived, not emitted by CV.
+5. CV pipeline runs locally outside Docker.
+6. Camera polygons are hardcoded.
+7. SQLite is used instead of PostgreSQL.
+8. CV processing can be slow on CPU.
+9. Dashboard uses polling instead of WebSockets.
+10. Roaming staff may be counted as customers.
+
+---
+
+## 20. Final Design Summary
+
+The implemented system is a pragmatic, challenge-ready retail intelligence platform.
+
+It prioritizes:
+
+```text
+working software
+clear API behavior
+reviewer-friendly deployment
+business metrics
+structured documentation
+honest limitations
+```
+
+The main missing production feature is full global identity resolution across cameras.

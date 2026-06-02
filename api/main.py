@@ -53,16 +53,15 @@ app = FastAPI(
 
 
 # ---------------------------------------------------------------------
-# Health helpers
+# Shared time helpers
 # ---------------------------------------------------------------------
 
 def _normalize_datetime_to_utc(value) -> Optional[datetime]:
     """
     Convert a database timestamp into a UTC-aware datetime.
 
-    SQLite/SQLAlchemy may return either timezone-naive datetimes or strings
-    depending on how data was inserted and serialized. This helper keeps the
-    health endpoint robust.
+    SQLite/SQLAlchemy may return timezone-naive datetimes. This helper
+    keeps health and metrics endpoints robust.
     """
 
     if value is None:
@@ -70,7 +69,6 @@ def _normalize_datetime_to_utc(value) -> Optional[datetime]:
 
     if isinstance(value, str):
         try:
-            # Handles strings ending with Z as UTC.
             value = value.replace("Z", "+00:00")
             value = datetime.fromisoformat(value)
         except ValueError:
@@ -84,6 +82,15 @@ def _normalize_datetime_to_utc(value) -> Optional[datetime]:
 
     return value.astimezone(timezone.utc)
 
+
+def _datetime_to_iso(value) -> Optional[str]:
+    normalized = _normalize_datetime_to_utc(value)
+    return normalized.isoformat() if normalized is not None else None
+
+
+# ---------------------------------------------------------------------
+# Health helpers
+# ---------------------------------------------------------------------
 
 def _check_database_health(db: Session) -> dict:
     """
@@ -241,8 +248,6 @@ def _get_session(db: Session, visitor_id: str) -> Optional[VisitorSession]:
 def _create_or_update_entry_session(db: Session, event_in: Event) -> VisitorSession:
     """
     Create or update a visitor session from an ENTRY event.
-
-    This keeps the session table as a materialized lifecycle view.
     """
 
     session = _get_session(db, event_in.visitor_id)
@@ -276,10 +281,8 @@ def _update_existing_session_from_event(
     """
     Update derived session state using non-ENTRY events.
 
-    Important:
-    This function does not create sessions for every random zone event.
-    The top-of-funnel session still starts from ENTRY. This avoids inflating
-    total visitors from cameras that do not observe the entrance.
+    This function does not create sessions for every zone event. The
+    top-of-funnel session still starts from ENTRY.
     """
 
     session = _get_session(db, event_in.visitor_id)
@@ -306,12 +309,6 @@ def _update_existing_session_from_event(
 def _validate_payload_shape(payload: Any) -> tuple[Optional[List[dict]], List[dict]]:
     """
     Validate only the outer batch envelope.
-
-    Returns:
-        (raw_events, errors)
-
-    This avoids FastAPI rejecting the whole batch with 422 when just one event
-    is malformed. Individual event validation happens later.
     """
 
     if not isinstance(payload, dict):
@@ -358,8 +355,6 @@ def _validate_payload_shape(payload: Any) -> tuple[Optional[List[dict]], List[di
 def _validate_raw_event(raw_event: Any, index: int) -> tuple[Optional[Event], Optional[dict]]:
     """
     Validate a single raw event dictionary with Pydantic.
-
-    One malformed event should not reject the whole batch.
     """
 
     if not isinstance(raw_event, dict):
@@ -529,15 +524,125 @@ async def ingest_events(
 
 
 # ---------------------------------------------------------------------
+# Metrics helpers
+# ---------------------------------------------------------------------
+
+def _compute_current_queue_depth(db: Session, store_id: str) -> int:
+    """
+    Compute current billing queue depth from the latest queue event per visitor.
+
+    Logic:
+    - Query BILLING_QUEUE_JOIN and BILLING_QUEUE_EXIT events.
+    - Keep the latest queue event per visitor.
+    - Count visitors whose latest queue event is JOIN.
+
+    This is event-derived and does not depend on VisitorSession, because
+    billing-camera visitor IDs may not always match entrance-camera sessions
+    until full Re-ID is implemented.
+    """
+
+    queue_events = (
+        db.query(
+            EventRecord.visitor_id,
+            EventRecord.event_type,
+            EventRecord.timestamp,
+            EventRecord.session_seq,
+        )
+        .filter(
+            EventRecord.store_id == store_id,
+            EventRecord.is_staff == False,
+            EventRecord.event_type.in_(
+                ["BILLING_QUEUE_JOIN", "BILLING_QUEUE_EXIT"]
+            ),
+        )
+        .order_by(
+            EventRecord.timestamp.asc(),
+            EventRecord.session_seq.asc().nullsfirst(),
+        )
+        .all()
+    )
+
+    latest_status_by_visitor = {}
+
+    for event in queue_events:
+        latest_status_by_visitor[event.visitor_id] = event.event_type
+
+    return sum(
+        1
+        for latest_status in latest_status_by_visitor.values()
+        if latest_status == "BILLING_QUEUE_JOIN"
+    )
+
+
+def _compute_avg_dwell_by_zone(db: Session, store_id: str) -> dict:
+    """
+    Compute average dwell time in milliseconds by zone.
+
+    Uses ZONE_DWELL events generated by the CV state machine.
+    """
+
+    rows = (
+        db.query(
+            EventRecord.zone_id,
+            EventRecord.sku_zone,
+            func.avg(EventRecord.dwell_ms).label("avg_dwell_ms"),
+        )
+        .filter(
+            EventRecord.store_id == store_id,
+            EventRecord.event_type == "ZONE_DWELL",
+            EventRecord.dwell_ms.isnot(None),
+            EventRecord.is_staff == False,
+        )
+        .group_by(EventRecord.zone_id, EventRecord.sku_zone)
+        .all()
+    )
+
+    result = {}
+
+    for row in rows:
+        zone_key = row.zone_id or row.sku_zone or "UNKNOWN"
+        result[zone_key] = round(float(row.avg_dwell_ms or 0.0), 2)
+
+    return result
+
+
+def _get_total_event_count(db: Session, store_id: str) -> int:
+    return (
+        db.query(EventRecord)
+        .filter(EventRecord.store_id == store_id)
+        .count()
+    )
+
+
+def _get_latest_event_timestamp(db: Session, store_id: str) -> Optional[str]:
+    latest_timestamp = (
+        db.query(func.max(EventRecord.timestamp))
+        .filter(EventRecord.store_id == store_id)
+        .scalar()
+    )
+
+    return _datetime_to_iso(latest_timestamp)
+
+
+# ---------------------------------------------------------------------
 # Analytics endpoints
 # ---------------------------------------------------------------------
 
 @app.get("/stores/{store_id}/metrics", tags=["Analytics"])
 async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
     """
-    Returns the real-time North Star Metric: Conversion Rate.
+    Returns real-time store metrics.
 
-    Staff sessions are excluded from customer metrics.
+    Backward-compatible fields:
+    - total_visitors
+    - converted_visitors
+    - conversion_rate_percentage
+
+    Milestone 6 added:
+    - current_queue_depth
+    - avg_dwell_ms_by_zone
+    - total_events
+    - last_event_timestamp
     """
 
     total_visitors = (
@@ -565,11 +670,20 @@ async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
         else 0.0
     )
 
+    current_queue_depth = _compute_current_queue_depth(db, store_id)
+    avg_dwell_ms_by_zone = _compute_avg_dwell_by_zone(db, store_id)
+    total_events = _get_total_event_count(db, store_id)
+    last_event_timestamp = _get_latest_event_timestamp(db, store_id)
+
     return {
         "store_id": store_id,
         "total_visitors": total_visitors,
         "converted_visitors": converted_visitors,
         "conversion_rate_percentage": round(conversion_rate, 2),
+        "current_queue_depth": current_queue_depth,
+        "avg_dwell_ms_by_zone": avg_dwell_ms_by_zone,
+        "total_events": total_events,
+        "last_event_timestamp": last_event_timestamp,
     }
 
 

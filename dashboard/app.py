@@ -9,13 +9,16 @@ import requests
 import streamlit as st
 
 
-# ---------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------
-
 API_BASE_URL = os.getenv("API_BASE_URL", "http://store-api:8000")
-STORE_ID = os.getenv("STORE_ID", "ST1008")
+DEFAULT_STORE_ID = os.getenv("STORE_ID", "ST1008")
 REFRESH_SECONDS = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "5"))
+
+STORE_OPTIONS = [
+    DEFAULT_STORE_ID,
+    "STORE_BLR_002",
+    "ST1076",
+    "store_1076",
+]
 
 
 st.set_page_config(
@@ -25,19 +28,7 @@ st.set_page_config(
 )
 
 
-# ---------------------------------------------------------------------
-# API helpers
-# ---------------------------------------------------------------------
-
 def _safe_get(endpoint: str) -> Optional[Dict[str, Any]]:
-    """
-    Safely call the FastAPI backend.
-
-    Returns:
-        dict if request succeeds
-        None if API is unavailable or response is invalid
-    """
-
     url = f"{API_BASE_URL}{endpoint}"
 
     try:
@@ -60,34 +51,26 @@ def fetch_health() -> Optional[Dict[str, Any]]:
 
 
 @st.cache_data(ttl=2)
-def fetch_metrics() -> Optional[Dict[str, Any]]:
-    return _safe_get(f"/stores/{STORE_ID}/metrics")
+def fetch_metrics(store_id: str) -> Optional[Dict[str, Any]]:
+    return _safe_get(f"/stores/{store_id}/metrics")
 
 
 @st.cache_data(ttl=2)
-def fetch_funnel() -> Optional[Dict[str, Any]]:
-    return _safe_get(f"/stores/{STORE_ID}/funnel")
+def fetch_funnel(store_id: str) -> Optional[Dict[str, Any]]:
+    return _safe_get(f"/stores/{store_id}/funnel")
 
 
 @st.cache_data(ttl=2)
-def fetch_heatmap() -> Optional[Dict[str, Any]]:
-    return _safe_get(f"/stores/{STORE_ID}/heatmap")
+def fetch_heatmap(store_id: str) -> Optional[Dict[str, Any]]:
+    return _safe_get(f"/stores/{store_id}/heatmap")
 
 
 @st.cache_data(ttl=2)
-def fetch_anomalies() -> Optional[Dict[str, Any]]:
-    return _safe_get(f"/stores/{STORE_ID}/anomalies")
+def fetch_anomalies(store_id: str) -> Optional[Dict[str, Any]]:
+    return _safe_get(f"/stores/{store_id}/anomalies")
 
-
-# ---------------------------------------------------------------------
-# Formatting helpers
-# ---------------------------------------------------------------------
 
 def format_ms(ms_value: Any) -> str:
-    """
-    Convert milliseconds into a readable value.
-    """
-
     try:
         ms = float(ms_value or 0)
     except (TypeError, ValueError):
@@ -108,7 +91,7 @@ def format_ms(ms_value: Any) -> str:
 def render_status_badge(status: str):
     status = (status or "UNKNOWN").upper()
 
-    if status in {"HEALTHY", "OK"}:
+    if status in {"HEALTHY", "OK", "CONNECTED"}:
         st.success(status)
     elif status == "CRITICAL":
         st.error(status)
@@ -118,19 +101,38 @@ def render_status_badge(status: str):
         st.info(status)
 
 
-# ---------------------------------------------------------------------
-# Render functions
-# ---------------------------------------------------------------------
-
-def render_header():
+def render_header(store_id: str):
     st.title("🛒 Store Intelligence Dashboard")
     st.caption(
-        f"Store: `{STORE_ID}` | API: `{API_BASE_URL}` | "
+        f"Store: `{store_id}` | API: `{API_BASE_URL}` | "
         f"Auto-refresh: every {REFRESH_SECONDS} seconds"
     )
 
 
-def render_health_panel(health: Optional[Dict[str, Any]]):
+def render_store_selector() -> str:
+    unique_options = []
+    for option in STORE_OPTIONS:
+        if option not in unique_options:
+            unique_options.append(option)
+
+    selected_store = st.sidebar.selectbox(
+        "Select Store",
+        options=unique_options,
+        index=0,
+    )
+
+    st.sidebar.caption(
+        "The selector supports the current ST1008 sample data and "
+        "STORE_BLR_002 acceptance-gate checks."
+    )
+
+    return selected_store
+
+
+def render_health_panel(
+    health: Optional[Dict[str, Any]],
+    store_id: str,
+):
     st.subheader("System Health")
 
     if not health:
@@ -142,7 +144,7 @@ def render_health_panel(health: Optional[Dict[str, Any]]):
     api_status = health.get("status", "UNKNOWN")
     database_status = health.get("database", {}).get("status", "UNKNOWN")
 
-    store_health = health.get("stores", {}).get(STORE_ID, {})
+    store_health = health.get("stores", {}).get(store_id, {})
     feed_status = store_health.get("feed_status", "NO_EVENTS")
     last_event_timestamp = store_health.get("last_event_timestamp")
 
@@ -161,7 +163,7 @@ def render_health_panel(health: Optional[Dict[str, Any]]):
     if last_event_timestamp:
         st.info(f"Last event timestamp: `{last_event_timestamp}`")
     else:
-        st.info("No event has been received yet.")
+        st.info("No event has been received yet for this store.")
 
     warnings = health.get("warnings", []) + store_health.get("warnings", [])
 
@@ -238,14 +240,22 @@ def render_funnel_panel(funnel: Optional[Dict[str, Any]]):
 
     labels = [
         "Entered Store",
+        "Visited Product Zone",
         "Joined Billing Queue",
         "Completed Purchase",
     ]
 
     values = [
         funnel_steps.get("1_entered_store", 0),
-        funnel_steps.get("2_entered_billing_queue", 0),
-        funnel_steps.get("3_completed_purchase", 0),
+        funnel_steps.get("2_visited_zone", 0),
+        funnel_steps.get(
+            "3_entered_billing_queue",
+            funnel_steps.get("2_entered_billing_queue", 0),
+        ),
+        funnel_steps.get(
+            "4_completed_purchase",
+            funnel_steps.get("3_completed_purchase", 0),
+        ),
     ]
 
     fig = go.Figure(
@@ -257,7 +267,7 @@ def render_funnel_panel(funnel: Optional[Dict[str, Any]]):
     )
 
     fig.update_layout(
-        height=420,
+        height=440,
         margin=dict(l=20, r=20, t=30, b=20),
     )
 
@@ -287,13 +297,14 @@ def render_funnel_panel(funnel: Optional[Dict[str, Any]]):
 
     with col4:
         st.metric(
-            "Queue Data Source",
-            insights.get("queue_data_source", "unknown"),
+            "Abandoned Queue Cycles",
+            insights.get("abandoned_queue_cycles", 0),
         )
 
     st.caption(
-        f"Average queue wait: "
-        f"{format_ms(insights.get('avg_queue_wait_ms', 0.0))}"
+        f"Current queue depth: {insights.get('current_queue_depth', 0)} | "
+        f"Average queue wait: {format_ms(insights.get('avg_queue_wait_ms', 0.0))} | "
+        f"Source: {insights.get('queue_data_source', 'unknown')}"
     )
 
 
@@ -425,21 +436,18 @@ def render_dwell_summary(metrics: Optional[Dict[str, Any]]):
     st.dataframe(df, use_container_width=True)
 
 
-# ---------------------------------------------------------------------
-# Main app
-# ---------------------------------------------------------------------
-
 def main():
-    render_header()
+    selected_store_id = render_store_selector()
+    render_header(selected_store_id)
 
     health = fetch_health()
-    metrics = fetch_metrics()
-    funnel = fetch_funnel()
-    heatmap = fetch_heatmap()
-    anomalies = fetch_anomalies()
+    metrics = fetch_metrics(selected_store_id)
+    funnel = fetch_funnel(selected_store_id)
+    heatmap = fetch_heatmap(selected_store_id)
+    anomalies = fetch_anomalies(selected_store_id)
 
     with st.container():
-        render_health_panel(health)
+        render_health_panel(health, selected_store_id)
 
     st.divider()
 

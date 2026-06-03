@@ -289,13 +289,6 @@ def _is_valid_uuid(value: Any) -> bool:
 
 
 def _get_or_generate_event_id(raw_event: dict) -> str:
-    """
-    Use a supplied UUID if valid. Otherwise generate a new UUID.
-
-    Uploaded sample events may contain queue_event_id values like
-    QUEUE_SAMPLE_001, which are not UUIDs and would fail validation.
-    """
-
     candidate = raw_event.get("event_id") or raw_event.get("queue_event_id")
 
     if candidate is not None and _is_valid_uuid(candidate):
@@ -547,27 +540,47 @@ def _create_event_record(event_in: Event) -> EventRecord:
     )
 
 
-def _get_session(db: Session, visitor_id: str) -> Optional[VisitorSession]:
+def _get_session(
+    db: Session,
+    store_id: str,
+    visitor_id: str,
+) -> Optional[VisitorSession]:
     return (
         db.query(VisitorSession)
-        .filter(VisitorSession.visitor_id == visitor_id)
+        .filter(
+            VisitorSession.store_id == store_id,
+            VisitorSession.visitor_id == visitor_id,
+        )
         .first()
     )
 
 
-def _create_or_update_entry_session(db: Session, event_in: Event) -> VisitorSession:
-    session = _get_session(db, event_in.visitor_id)
+def _create_session_if_missing(
+    db: Session,
+    event_in: Event,
+) -> VisitorSession:
+    session = _get_session(
+        db=db,
+        store_id=event_in.store_id,
+        visitor_id=event_in.visitor_id,
+    )
 
     if session is None:
         session = VisitorSession(
             visitor_id=event_in.visitor_id,
             store_id=event_in.store_id,
-            entry_time=event_in.timestamp,
+            entry_time=None,
             last_seen_time=event_in.timestamp,
             is_staff=event_in.is_staff,
         )
         db.add(session)
-        return session
+        db.flush()
+
+    return session
+
+
+def _create_or_update_entry_session(db: Session, event_in: Event) -> VisitorSession:
+    session = _create_session_if_missing(db, event_in)
 
     if session.entry_time is None:
         session.entry_time = event_in.timestamp
@@ -584,10 +597,14 @@ def _update_existing_session_from_event(
     db: Session,
     event_in: Event,
 ) -> Optional[VisitorSession]:
-    session = _get_session(db, event_in.visitor_id)
+    session = _get_session(
+        db=db,
+        store_id=event_in.store_id,
+        visitor_id=event_in.visitor_id,
+    )
 
     if session is None:
-        return None
+        session = _create_session_if_missing(db, event_in)
 
     session.last_seen_time = event_in.timestamp
 
@@ -596,8 +613,18 @@ def _update_existing_session_from_event(
 
     event_type = event_in.event_type.value
 
-    if event_type == "BILLING_QUEUE_JOIN":
+    if event_type == "ZONE_ENTER":
+        # No schema migration in this phase.
+        # Zone-visit funnel is derived from raw events.
+
+        if session.entry_time is None:
+            session.entry_time = event_in.timestamp
+
+    elif event_type == "BILLING_QUEUE_JOIN":
         session.billing_join_time = event_in.timestamp
+
+        if session.entry_time is None:
+            session.entry_time = event_in.timestamp
 
     elif event_type in {
         "BILLING_QUEUE_EXIT",
@@ -605,11 +632,17 @@ def _update_existing_session_from_event(
     }:
         session.billing_exit_time = event_in.timestamp
 
+        if session.entry_time is None:
+            session.entry_time = event_in.timestamp
+
     elif event_type == "EXIT":
         session.last_seen_time = event_in.timestamp
 
     elif event_type == "REENTRY":
         session.last_seen_time = event_in.timestamp
+
+        if session.entry_time is None:
+            session.entry_time = event_in.timestamp
 
     return session
 
@@ -927,6 +960,43 @@ def _get_latest_event_timestamp(db: Session, store_id: str) -> Optional[str]:
     return _datetime_to_iso(latest_timestamp)
 
 
+def _count_entered_store(db: Session, store_id: str) -> int:
+    return (
+        db.query(VisitorSession)
+        .filter(
+            VisitorSession.store_id == store_id,
+            VisitorSession.is_staff == False,
+            VisitorSession.entry_time.isnot(None),
+        )
+        .count()
+    )
+
+
+def _count_zone_visitors(db: Session, store_id: str) -> int:
+    return (
+        db.query(EventRecord.visitor_id)
+        .filter(
+            EventRecord.store_id == store_id,
+            EventRecord.is_staff == False,
+            EventRecord.event_type.in_(["ZONE_ENTER", "ZONE_DWELL"]),
+        )
+        .distinct()
+        .count()
+    )
+
+
+def _count_converted_visitors(db: Session, store_id: str) -> int:
+    return (
+        db.query(VisitorSession)
+        .filter(
+            VisitorSession.store_id == store_id,
+            VisitorSession.is_staff == False,
+            VisitorSession.is_converted == True,
+        )
+        .count()
+    )
+
+
 # ---------------------------------------------------------------------
 # Queue / Funnel helpers
 # ---------------------------------------------------------------------
@@ -1183,24 +1253,8 @@ def _rollup_anomaly_status(anomalies: list) -> str:
 
 
 def _get_conversion_stats(db: Session, store_id: str) -> dict:
-    total_visitors = (
-        db.query(VisitorSession)
-        .filter(
-            VisitorSession.store_id == store_id,
-            VisitorSession.is_staff == False,
-        )
-        .count()
-    )
-
-    converted_visitors = (
-        db.query(VisitorSession)
-        .filter(
-            VisitorSession.store_id == store_id,
-            VisitorSession.is_staff == False,
-            VisitorSession.is_converted == True,
-        )
-        .count()
-    )
+    total_visitors = _count_entered_store(db, store_id)
+    converted_visitors = _count_converted_visitors(db, store_id)
 
     conversion_rate = (
         converted_visitors / total_visitors * 100
@@ -1438,35 +1492,9 @@ async def get_store_heatmap(store_id: str, db: Session = Depends(get_db)):
 
 @app.get("/stores/{store_id}/funnel", tags=["Analytics"])
 async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
-    entered_store = (
-        db.query(VisitorSession)
-        .filter(
-            VisitorSession.store_id == store_id,
-            VisitorSession.is_staff == False,
-        )
-        .count()
-    )
-
-    zone_visit = (
-        db.query(EventRecord.visitor_id)
-        .filter(
-            EventRecord.store_id == store_id,
-            EventRecord.is_staff == False,
-            EventRecord.event_type == "ZONE_ENTER",
-        )
-        .distinct()
-        .count()
-    )
-
-    converted = (
-        db.query(VisitorSession)
-        .filter(
-            VisitorSession.store_id == store_id,
-            VisitorSession.is_staff == False,
-            VisitorSession.is_converted == True,
-        )
-        .count()
-    )
+    entered_store = _count_entered_store(db, store_id)
+    zone_visit = _count_zone_visitors(db, store_id)
+    converted = _count_converted_visitors(db, store_id)
 
     queue_summary = _compute_queue_summary(db, store_id)
 
@@ -1490,21 +1518,17 @@ async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
 
     return {
         "store_id": store_id,
-
-        # Challenge-aligned funnel:
-        # Entry → Zone Visit → Billing Queue → Purchase
         "funnel_steps": {
+            # Challenge-aligned funnel
             "1_entered_store": entered_store,
             "2_visited_zone": zone_visit,
             "3_entered_billing_queue": entered_billing,
             "4_completed_purchase": converted,
 
-            # Backward-compatible keys used by earlier tests/dashboard.
-            # Keep these until dashboard is fully migrated.
+            # Backward-compatible keys used by earlier tests/dashboard
             "2_entered_billing_queue": entered_billing,
             "3_completed_purchase": converted,
         },
-
         "insights": {
             "queue_abandonment_count": queue_abandonment_count,
             "queue_abandonment_rate": queue_abandonment_rate,
@@ -1515,6 +1539,7 @@ async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
             "queue_data_source": queue_summary["queue_data_source"],
         },
     }
+
 
 @app.get("/stores/{store_id}/anomalies", tags=["Analytics"])
 async def get_store_anomalies(store_id: str, db: Session = Depends(get_db)):

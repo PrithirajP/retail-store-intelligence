@@ -73,14 +73,6 @@ app = FastAPI(
 # ---------------------------------------------------------------------
 
 def _extract_store_id_from_path(path: str) -> Optional[str]:
-    """
-    Extract store_id from paths like:
-    /stores/ST1008/metrics
-    /stores/ST1008/funnel
-    /stores/ST1008/heatmap
-    /stores/ST1008/anomalies
-    """
-
     parts = [part for part in path.split("/") if part]
 
     if len(parts) >= 2 and parts[0] == "stores":
@@ -90,40 +82,15 @@ def _extract_store_id_from_path(path: str) -> Optional[str]:
 
 
 def _get_or_create_trace_id(request: Request) -> str:
-    """
-    Use incoming trace ID if provided; otherwise generate one.
-    """
-
     return request.headers.get("X-Trace-Id") or str(uuid.uuid4())
 
 
 def _log_json(payload: dict):
-    """
-    Emit one structured JSON log line using standard logging.
-    """
-
     logger.info(json.dumps(payload, sort_keys=True, default=str))
 
 
 @app.middleware("http")
 async def structured_logging_middleware(request: Request, call_next):
-    """
-    Structured request logging middleware.
-
-    Logs:
-    - trace_id
-    - method
-    - endpoint
-    - status_code
-    - latency_ms
-    - store_id
-    - client_host
-
-    Important:
-    The middleware does not read the request body, so it does not interfere
-    with /events/ingest payload parsing.
-    """
-
     start_time = time.perf_counter()
     trace_id = _get_or_create_trace_id(request)
     request.state.trace_id = trace_id
@@ -310,6 +277,253 @@ async def health_check(db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------
+# Event normalization helpers
+# ---------------------------------------------------------------------
+
+def _is_valid_uuid(value: Any) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _get_or_generate_event_id(raw_event: dict) -> str:
+    """
+    Use a supplied UUID if valid. Otherwise generate a new UUID.
+
+    Uploaded sample events may contain queue_event_id values like
+    QUEUE_SAMPLE_001, which are not UUIDs and would fail validation.
+    """
+
+    candidate = raw_event.get("event_id") or raw_event.get("queue_event_id")
+
+    if candidate is not None and _is_valid_uuid(candidate):
+        return str(candidate)
+
+    return str(uuid.uuid4())
+
+
+def _normalize_event_type(raw_event_type: Any) -> Optional[str]:
+    if raw_event_type is None:
+        return None
+
+    event_type = str(raw_event_type).strip()
+
+    if not event_type:
+        return None
+
+    canonical = event_type.upper()
+
+    direct_supported = {
+        "ENTRY",
+        "EXIT",
+        "ZONE_ENTER",
+        "ZONE_EXIT",
+        "ZONE_DWELL",
+        "BILLING_QUEUE_JOIN",
+        "BILLING_QUEUE_EXIT",
+        "BILLING_QUEUE_ABANDON",
+        "REENTRY",
+    }
+
+    if canonical in direct_supported:
+        return canonical
+
+    event_type_map = {
+        "entry": "ENTRY",
+        "exit": "EXIT",
+        "zone_entered": "ZONE_ENTER",
+        "zone_exited": "ZONE_EXIT",
+        "zone_enter": "ZONE_ENTER",
+        "zone_exit": "ZONE_EXIT",
+        "zone_dwell": "ZONE_DWELL",
+        "queue_joined": "BILLING_QUEUE_JOIN",
+        "queue_entered": "BILLING_QUEUE_JOIN",
+        "billing_queue_join": "BILLING_QUEUE_JOIN",
+        "queue_completed": "BILLING_QUEUE_EXIT",
+        "queue_served": "BILLING_QUEUE_EXIT",
+        "billing_queue_exit": "BILLING_QUEUE_EXIT",
+        "queue_abandoned": "BILLING_QUEUE_ABANDON",
+        "billing_queue_abandon": "BILLING_QUEUE_ABANDON",
+        "reentry": "REENTRY",
+        "re_entry": "REENTRY",
+    }
+
+    return event_type_map.get(event_type.lower())
+
+
+def _extract_normalized_timestamp(raw_event: dict) -> Optional[str]:
+    for key in [
+        "timestamp",
+        "event_timestamp",
+        "event_time",
+        "queue_exit_ts",
+        "queue_served_ts",
+        "queue_join_ts",
+    ]:
+        value = raw_event.get(key)
+        if value:
+            return value
+
+    return None
+
+
+def _extract_normalized_store_id(raw_event: dict) -> Optional[str]:
+    return (
+        raw_event.get("store_id")
+        or raw_event.get("store_code")
+        or raw_event.get("store")
+    )
+
+
+def _extract_normalized_visitor_id(raw_event: dict) -> Optional[str]:
+    value = (
+        raw_event.get("visitor_id")
+        or raw_event.get("id_token")
+        or raw_event.get("track_id")
+        or raw_event.get("person_id")
+    )
+
+    if value is None:
+        return None
+
+    return str(value)
+
+
+def _extract_normalized_zone_id(raw_event: dict) -> Optional[str]:
+    return raw_event.get("zone_id") or raw_event.get("zone_name")
+
+
+def _extract_normalized_dwell_ms(
+    raw_event: dict,
+    normalized_event_type: Optional[str],
+) -> Optional[int]:
+    if raw_event.get("dwell_ms") is not None:
+        try:
+            return int(raw_event.get("dwell_ms"))
+        except (TypeError, ValueError):
+            return None
+
+    if raw_event.get("wait_seconds") is not None:
+        try:
+            return int(float(raw_event.get("wait_seconds")) * 1000)
+        except (TypeError, ValueError):
+            return None
+
+    if normalized_event_type in {
+        "ENTRY",
+        "EXIT",
+        "ZONE_ENTER",
+        "ZONE_EXIT",
+        "BILLING_QUEUE_JOIN",
+        "BILLING_QUEUE_EXIT",
+        "BILLING_QUEUE_ABANDON",
+        "REENTRY",
+    }:
+        return None
+
+    return None
+
+
+def _build_normalized_metadata(raw_event: dict) -> dict:
+    existing_metadata = raw_event.get("metadata")
+
+    if isinstance(existing_metadata, dict):
+        metadata = dict(existing_metadata)
+    else:
+        metadata = {}
+
+    if metadata.get("queue_depth") is None:
+        queue_depth = raw_event.get("queue_depth")
+
+        if queue_depth is None:
+            queue_depth = raw_event.get("queue_position_at_join")
+
+        if queue_depth is not None:
+            try:
+                metadata["queue_depth"] = int(queue_depth)
+            except (TypeError, ValueError):
+                metadata["queue_depth"] = None
+
+    if metadata.get("sku_zone") is None:
+        metadata["sku_zone"] = (
+            raw_event.get("sku_zone")
+            or raw_event.get("zone_name")
+            or raw_event.get("brand_name")
+        )
+
+    if metadata.get("session_seq") is None:
+        session_seq = raw_event.get("session_seq")
+
+        if session_seq is not None:
+            try:
+                metadata["session_seq"] = int(session_seq)
+            except (TypeError, ValueError):
+                metadata["session_seq"] = None
+        else:
+            metadata["session_seq"] = None
+
+    return {
+        "queue_depth": metadata.get("queue_depth"),
+        "sku_zone": metadata.get("sku_zone"),
+        "session_seq": metadata.get("session_seq"),
+    }
+
+
+def _extract_normalized_confidence(raw_event: dict) -> float:
+    confidence = raw_event.get("confidence")
+
+    if confidence is None:
+        confidence = raw_event.get("score")
+
+    if confidence is None:
+        return 0.50
+
+    try:
+        confidence_float = float(confidence)
+    except (TypeError, ValueError):
+        return 0.50
+
+    return min(max(confidence_float, 0.0), 1.0)
+
+
+def _extract_normalized_is_staff(raw_event: dict) -> bool:
+    value = raw_event.get("is_staff", False)
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y"}
+
+    return bool(value)
+
+
+def _normalize_incoming_event(raw_event: dict) -> dict:
+    normalized_event_type = _normalize_event_type(raw_event.get("event_type"))
+
+    normalized = {
+        "event_id": _get_or_generate_event_id(raw_event),
+        "store_id": _extract_normalized_store_id(raw_event),
+        "camera_id": raw_event.get("camera_id"),
+        "visitor_id": _extract_normalized_visitor_id(raw_event),
+        "timestamp": _extract_normalized_timestamp(raw_event),
+        "event_type": normalized_event_type,
+        "zone_id": _extract_normalized_zone_id(raw_event),
+        "dwell_ms": _extract_normalized_dwell_ms(
+            raw_event,
+            normalized_event_type,
+        ),
+        "is_staff": _extract_normalized_is_staff(raw_event),
+        "confidence": _extract_normalized_confidence(raw_event),
+        "metadata": _build_normalized_metadata(raw_event),
+    }
+
+    return normalized
+
+
+# ---------------------------------------------------------------------
 # Ingestion helpers
 # ---------------------------------------------------------------------
 
@@ -385,8 +599,17 @@ def _update_existing_session_from_event(
     if event_type == "BILLING_QUEUE_JOIN":
         session.billing_join_time = event_in.timestamp
 
-    elif event_type == "BILLING_QUEUE_EXIT":
+    elif event_type in {
+        "BILLING_QUEUE_EXIT",
+        "BILLING_QUEUE_ABANDON",
+    }:
         session.billing_exit_time = event_in.timestamp
+
+    elif event_type == "EXIT":
+        session.last_seen_time = event_in.timestamp
+
+    elif event_type == "REENTRY":
+        session.last_seen_time = event_in.timestamp
 
     return session
 
@@ -433,7 +656,10 @@ def _validate_payload_shape(payload: Any) -> tuple[Optional[List[dict]], List[di
     return raw_events, []
 
 
-def _validate_raw_event(raw_event: Any, index: int) -> tuple[Optional[Event], Optional[dict]]:
+def _validate_raw_event(
+    raw_event: Any,
+    index: int,
+) -> tuple[Optional[Event], Optional[dict]]:
     if not isinstance(raw_event, dict):
         return None, {
             "index": index,
@@ -441,12 +667,19 @@ def _validate_raw_event(raw_event: Any, index: int) -> tuple[Optional[Event], Op
             "error": "Event must be a JSON object.",
         }
 
+    normalized_event = _normalize_incoming_event(raw_event)
+
     try:
-        return Event.model_validate(raw_event), None
+        return Event.model_validate(normalized_event), None
+
     except ValidationError as e:
         return None, {
             "index": index,
-            "event_id": raw_event.get("event_id"),
+            "event_id": (
+                raw_event.get("event_id")
+                or raw_event.get("queue_event_id")
+                or normalized_event.get("event_id")
+            ),
             "error": e.errors(),
         }
 
@@ -624,7 +857,11 @@ def _compute_current_queue_depth(db: Session, store_id: str) -> int:
             EventRecord.store_id == store_id,
             EventRecord.is_staff == False,
             EventRecord.event_type.in_(
-                ["BILLING_QUEUE_JOIN", "BILLING_QUEUE_EXIT"]
+                [
+                    "BILLING_QUEUE_JOIN",
+                    "BILLING_QUEUE_EXIT",
+                    "BILLING_QUEUE_ABANDON",
+                ]
             ),
         )
         .order_by(
@@ -706,7 +943,11 @@ def _get_queue_events(db: Session, store_id: str) -> list:
             EventRecord.store_id == store_id,
             EventRecord.is_staff == False,
             EventRecord.event_type.in_(
-                ["BILLING_QUEUE_JOIN", "BILLING_QUEUE_EXIT"]
+                [
+                    "BILLING_QUEUE_JOIN",
+                    "BILLING_QUEUE_EXIT",
+                    "BILLING_QUEUE_ABANDON",
+                ]
             ),
         )
         .order_by(
@@ -722,6 +963,7 @@ def _get_queue_cycles(db: Session, store_id: str) -> dict:
 
     open_join_by_visitor = {}
     completed_cycles = []
+    abandoned_cycles = []
     joined_visitors = set()
 
     for event in queue_events:
@@ -734,7 +976,7 @@ def _get_queue_cycles(db: Session, store_id: str) -> dict:
             if visitor_id not in open_join_by_visitor:
                 open_join_by_visitor[visitor_id] = event.timestamp
 
-        elif event_type == "BILLING_QUEUE_EXIT":
+        elif event_type in {"BILLING_QUEUE_EXIT", "BILLING_QUEUE_ABANDON"}:
             join_time = open_join_by_visitor.pop(visitor_id, None)
 
             if join_time is None:
@@ -745,18 +987,22 @@ def _get_queue_cycles(db: Session, store_id: str) -> dict:
             if wait_ms is None:
                 continue
 
-            completed_cycles.append(
-                {
-                    "visitor_id": visitor_id,
-                    "join_time": _datetime_to_iso(join_time),
-                    "exit_time": _datetime_to_iso(event.timestamp),
-                    "wait_ms": wait_ms,
-                }
-            )
+            cycle = {
+                "visitor_id": visitor_id,
+                "join_time": _datetime_to_iso(join_time),
+                "exit_time": _datetime_to_iso(event.timestamp),
+                "wait_ms": wait_ms,
+            }
+
+            if event_type == "BILLING_QUEUE_ABANDON":
+                abandoned_cycles.append(cycle)
+            else:
+                completed_cycles.append(cycle)
 
     return {
         "joined_visitors": joined_visitors,
         "completed_cycles": completed_cycles,
+        "abandoned_cycles": abandoned_cycles,
         "open_queue_visitors": set(open_join_by_visitor.keys()),
     }
 
@@ -766,13 +1012,17 @@ def _compute_queue_summary(db: Session, store_id: str) -> dict:
 
     joined_count = len(queue_state["joined_visitors"])
     completed_cycles = queue_state["completed_cycles"]
+    abandoned_cycles = queue_state["abandoned_cycles"]
     completed_queue_cycles = len(completed_cycles)
+    abandoned_queue_cycles = len(abandoned_cycles)
     current_queue_depth = len(queue_state["open_queue_visitors"])
 
-    if completed_cycles:
+    all_closed_cycles = completed_cycles + abandoned_cycles
+
+    if all_closed_cycles:
         avg_queue_wait_ms = round(
-            sum(cycle["wait_ms"] for cycle in completed_cycles)
-            / completed_queue_cycles,
+            sum(cycle["wait_ms"] for cycle in all_closed_cycles)
+            / len(all_closed_cycles),
             2,
         )
     else:
@@ -781,6 +1031,7 @@ def _compute_queue_summary(db: Session, store_id: str) -> dict:
     return {
         "entered_billing_queue": joined_count,
         "completed_queue_cycles": completed_queue_cycles,
+        "abandoned_queue_cycles": abandoned_queue_cycles,
         "current_queue_depth": current_queue_depth,
         "avg_queue_wait_ms": avg_queue_wait_ms,
         "queue_data_source": "event_stream",
@@ -1196,6 +1447,17 @@ async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
         .count()
     )
 
+    zone_visit = (
+        db.query(EventRecord.visitor_id)
+        .filter(
+            EventRecord.store_id == store_id,
+            EventRecord.is_staff == False,
+            EventRecord.event_type == "ZONE_ENTER",
+        )
+        .distinct()
+        .count()
+    )
+
     converted = (
         db.query(VisitorSession)
         .filter(
@@ -1210,32 +1472,49 @@ async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
 
     entered_billing = queue_summary["entered_billing_queue"]
     completed_queue_cycles = queue_summary["completed_queue_cycles"]
+    abandoned_queue_cycles = queue_summary["abandoned_queue_cycles"]
 
-    queue_abandonment_count = max(completed_queue_cycles - converted, 0)
+    queue_abandonment_count = max(
+        abandoned_queue_cycles,
+        completed_queue_cycles - converted,
+        0,
+    )
+
+    closed_queue_cycles = completed_queue_cycles + abandoned_queue_cycles
 
     queue_abandonment_rate = (
-        round(queue_abandonment_count / completed_queue_cycles * 100, 2)
-        if completed_queue_cycles > 0
+        round(queue_abandonment_count / closed_queue_cycles * 100, 2)
+        if closed_queue_cycles > 0
         else 0.0
     )
 
     return {
         "store_id": store_id,
+
+        # Challenge-aligned funnel:
+        # Entry → Zone Visit → Billing Queue → Purchase
         "funnel_steps": {
             "1_entered_store": entered_store,
+            "2_visited_zone": zone_visit,
+            "3_entered_billing_queue": entered_billing,
+            "4_completed_purchase": converted,
+
+            # Backward-compatible keys used by earlier tests/dashboard.
+            # Keep these until dashboard is fully migrated.
             "2_entered_billing_queue": entered_billing,
             "3_completed_purchase": converted,
         },
+
         "insights": {
             "queue_abandonment_count": queue_abandonment_count,
             "queue_abandonment_rate": queue_abandonment_rate,
             "avg_queue_wait_ms": queue_summary["avg_queue_wait_ms"],
             "completed_queue_cycles": completed_queue_cycles,
+            "abandoned_queue_cycles": abandoned_queue_cycles,
             "current_queue_depth": queue_summary["current_queue_depth"],
             "queue_data_source": queue_summary["queue_data_source"],
         },
     }
-
 
 @app.get("/stores/{store_id}/anomalies", tags=["Analytics"])
 async def get_store_anomalies(store_id: str, db: Session = Depends(get_db)):

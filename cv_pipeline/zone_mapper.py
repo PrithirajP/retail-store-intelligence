@@ -22,7 +22,7 @@ def click_event(event, x, y, flags, params):
 
 if __name__ == "__main__":
 
-    video_path = "../data/CAM_5.mp4" 
+    video_path = "../data/STORE_2/ZONE.mp4" 
     
     cap = cv2.VideoCapture(video_path)
     success, original_img = cap.read()

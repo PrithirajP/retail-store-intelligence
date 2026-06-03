@@ -14,10 +14,8 @@ DEFAULT_STORE_ID = os.getenv("STORE_ID", "ST1008")
 REFRESH_SECONDS = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "5"))
 
 STORE_OPTIONS = [
-    DEFAULT_STORE_ID,
-    "STORE_BLR_002",
-    "ST1076",
-    "store_1076",
+    "ST1008",
+    "STORE_2",
 ]
 
 

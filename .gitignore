@@ -1,50 +1,22 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-.Python
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
+data/*
+!data/.gitkeep
+!data/README.md
 
-# Virtual environments
-venv/
-.env/
-.venv/
-ENV/
-
-# Local environment/config
-.env
-.env.*
-!.env.example
-
-# Databases and runtime state
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.csv
+*.jsonl
 *.db
 *.sqlite
 *.sqlite3
-store_intelligence.db
-
-# Model weights / generated ML artifacts
-yolov8n.pt
 *.pt
+*.pth
 runs/
-
-# Data files - challenge data should not be committed
-data/*.mp4
-data/*.avi
-data/*.mov
-data/*.mkv
-data/*.csv
-
-# OS/editor files
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-
-# Streamlit
-.streamlit/secrets.toml
+venv/
+__pycache__/
+.pytest_cache/

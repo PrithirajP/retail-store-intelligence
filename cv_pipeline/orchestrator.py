@@ -318,10 +318,13 @@ def process_camera(
         print(f"WARNING: Could not open {video_path}. Skipping {store_id}/{camera_id}.")
         return
 
+    entrance_line = camera_config.get("entrance_line")
+
     tracker = build_tracker(
         store_id=store_id,
         camera_id=camera_id,
         zones=zones,
+        entrance_line=entrance_line,
     )
 
     frame_index = 0

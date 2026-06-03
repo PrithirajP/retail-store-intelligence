@@ -1,88 +1,58 @@
 # Retail Store Intelligence Platform
 
-A computer-vision-powered Store Intelligence Platform that converts CCTV video streams into structured retail analytics.
+A computer-vision-powered retail analytics system that converts CCTV-style store activity and POS transaction data into structured store intelligence.
 
-The system detects and tracks people in store camera feeds, maps their movement to store zones, emits structured events, ingests those events through a FastAPI backend, stores them in SQLite, correlates billing-zone activity with POS transactions, and displays live metrics through a Streamlit dashboard.
+The system detects shopper activity, maps movement into store zones, emits structured events, ingests them through a FastAPI backend, stores them in SQLite, correlates billing activity with POS transactions, and displays business metrics through a Streamlit dashboard.
 
 ---
 
-## 1. Project Overview
+## 1. What This Project Does
 
-This project is built for a retail analytics challenge where the goal is to estimate and expose store-level intelligence such as:
+The platform estimates and exposes:
 
-* Total unique visitors
-* Conversion rate
-* Billing queue participation
-* Queue abandonment
-* Average queue wait time
-* Zone dwell analytics
-* Zone heatmap scores
-* Operational anomalies
+* total visitors
+* product-zone visits
+* billing queue participation
+* completed purchases
+* conversion rate
+* queue abandonment
+* current queue depth
+* average queue wait time
+* average dwell time by zone
+* zone-level heatmap scores
+* operational anomalies
 * API health and stale-feed status
 
-The system follows an edge-cloud architecture:
-
-```text
-CCTV Videos
-   ↓
-YOLOv8n + ByteTrack CV Pipeline
-   ↓
-Zone / Queue / Staff State Machine
-   ↓
-Structured Event Payloads
-   ↓
-FastAPI Ingestion API
-   ↓
-SQLite Database
-   ↓
-Metrics / Funnel / Heatmap / Anomalies APIs
-   ↓
-Streamlit Dashboard
-```
-
 ---
 
-## 2. Current Architecture
-
-The project has two main runtime layers.
-
-### 2.1 Cloud Layer
-
-The cloud layer is containerized using Docker Compose.
-
-It contains:
+## 2. Architecture Summary
 
 ```text
-store-api        FastAPI backend
-store-dashboard  Streamlit dashboard
+CCTV videos / sample event payloads
+        ↓
+CV edge pipeline or event replay
+        ↓
+Event normalization layer
+        ↓
+Canonical Event Schema v1.2
+        ↓
+FastAPI ingestion API
+        ↓
+SQLite database
+        ↓
+Metrics / Funnel / Heatmap / Anomalies / Health endpoints
+        ↓
+Streamlit dashboard
 ```
 
-The FastAPI service handles:
+The project uses an edge-cloud split:
 
-* Event ingestion
-* Event validation
-* Idempotent event persistence
-* Visitor session materialization
-* POS transaction seeding
-* POS correlation
-* Metrics calculation
-* Funnel calculation
-* Heatmap calculation
-* Rule-based anomaly detection
-* Health and feed freshness reporting
-
-The dashboard polls the API and displays live metrics.
-
-### 2.2 Edge Layer
-
-The CV pipeline currently runs on the host machine:
-
-```bash
-cd cv_pipeline
-python orchestrator.py
+```text
+Cloud layer: API + Dashboard inside Docker
+Edge layer: CV pipeline runs locally on the host machine
 ```
 
-This was a deliberate engineering trade-off to avoid PyTorch/OpenCV/Docker GPU compatibility failures during review. The API and dashboard are fully containerized; the CV worker is run locally as an edge process.
+This split avoids PyTorch/OpenCV/Ultralytics Docker compatibility issues while keeping the API and dashboard easy to run.
 
 ---
 
@@ -95,16 +65,16 @@ retail-store-intelligence/
 │   ├── database.py
 │   ├── main.py
 │   ├── models.py
-│   ├── requirements.txt
-│   └── seed_data.py
+│   ├── seed_data.py
+│   └── requirements.txt
 │
 ├── cv_pipeline/
 │   ├── detector.py
 │   ├── event_emitter.py
 │   ├── orchestrator.py
-│   ├── requirements.txt
 │   ├── tracker_state.py
-│   └── zone_mapper.py
+│   ├── zone_mapper.py
+│   └── requirements.txt
 │
 ├── dashboard/
 │   ├── Dockerfile
@@ -113,12 +83,19 @@ retail-store-intelligence/
 │
 ├── tests/
 │   ├── conftest.py
+│   ├── test_acceptance_gate.py
 │   ├── test_anomalies.py
+│   ├── test_anomaly_rules.py
 │   ├── test_funnel.py
+│   ├── test_funnel_session_logic.py
 │   ├── test_health.py
 │   ├── test_heatmap.py
+│   ├── test_heatmap_populated.py
 │   ├── test_ingest.py
-│   └── test_metrics.py
+│   ├── test_metrics.py
+│   ├── test_sample_events_ingest.py
+│   ├── test_seed_data.py
+│   └── test_staff_filtering.py
 │
 ├── data/
 │   ├── Brigade_Bangalore_10_April_26.csv
@@ -139,83 +116,31 @@ retail-store-intelligence/
 
 ## 4. Required Data Placement
 
-Before running the project, create a `data/` folder at the project root and place the required dataset files inside it.
+Create a `data/` folder at the project root.
 
-Expected structure:
-
-```text
-retail-store-intelligence/
-└── data/
-    ├── Brigade_Bangalore_10_April_26.csv
-    ├── CAM_01.mp4
-    ├── CAM_02.mp4
-    ├── CAM_03.mp4
-    └── CAM_05.mp4
-```
-
-The POS transaction file must be named exactly:
+Expected files:
 
 ```text
-Brigade_Bangalore_10_April_26.csv
+data/Brigade_Bangalore_10_April_26.csv
+data/CAM_01.mp4
+data/CAM_02.mp4
+data/CAM_03.mp4
+data/CAM_05.mp4
 ```
 
-The API container mounts the local `data/` folder into:
-
-```text
-/app/data
-```
-
-and seeds POS transactions from:
+The POS CSV is mounted into the API container at:
 
 ```text
 /app/data/Brigade_Bangalore_10_April_26.csv
 ```
 
----
-
-## 5. Camera File Mapping
-
-The CV orchestrator currently uses the following hardcoded video mapping:
-
-```text
-CAM_ENTRANCE  -> ../data/CAM_03.mp4
-CAM_BILLING   -> ../data/CAM_05.mp4
-CAM_MAKEUP    -> ../data/CAM_02.mp4
-CAM_SKINCARE  -> ../data/CAM_01.mp4
-```
-
-This mapping is defined in:
-
-```text
-cv_pipeline/orchestrator.py
-```
-
-Important: because the paths use `../data/...`, run the CV pipeline from inside the `cv_pipeline/` folder:
-
-```bash
-cd cv_pipeline
-python orchestrator.py
-```
+The CV pipeline expects videos relative to `cv_pipeline/`, so run the CV script from inside that folder.
 
 ---
 
-## 6. Quickstart
+## 5. Quick Start
 
-### Step 1: Start Docker Desktop
-
-Make sure Docker Desktop is running and using Linux containers.
-
-Check Docker with:
-
-```bash
-docker ps
-```
-
-If this command fails, start Docker Desktop first.
-
----
-
-### Step 2: Start API and Dashboard
+### Step 1 — Start API and Dashboard
 
 From the project root:
 
@@ -223,82 +148,41 @@ From the project root:
 docker compose up --build
 ```
 
-This starts:
-
-```text
-FastAPI API      http://localhost:8000
-Streamlit UI     http://localhost:8501
-```
-
-The dashboard will start after the API healthcheck passes.
-
----
-
-### Step 3: Verify API Health
-
 Open:
 
 ```text
 http://localhost:8000/health
-```
-
-Before CV events are ingested, expected response will be similar to:
-
-```json
-{
-  "status": "healthy",
-  "database": {
-    "status": "connected"
-  },
-  "stores": {},
-  "warnings": [
-    "NO_EVENTS_RECEIVED"
-  ]
-}
-```
-
----
-
-### Step 4: Open Dashboard
-
-Open:
-
-```text
 http://localhost:8501
 ```
 
-Initially, the dashboard may show zero visitors and zero conversions. This is expected before the CV pipeline sends events.
+### Step 2 — Run the CV Pipeline
 
----
-
-### Step 5: Run CV Pipeline
-
-Open a second terminal.
-
-From the project root:
+In a second terminal:
 
 ```bash
 cd cv_pipeline
 python orchestrator.py
 ```
 
-Expected behavior:
+### Step 3 — Run Tests
+
+From the project root:
+
+```bash
+pytest
+```
+
+Expected result after all phases:
 
 ```text
-YOLOv8 model loads
-camera videos are processed sequentially
-zone events are generated
-event batches are posted to FastAPI
-dashboard metrics begin updating
+32 passed
 ```
 
 ---
 
-## 7. Installing CV Dependencies Locally
+## 6. Local CV Environment Setup
 
 The CV pipeline runs outside Docker.
-
-Create and activate a virtual environment:
 
 ### Windows PowerShell
 
@@ -306,6 +190,8 @@ Create and activate a virtual environment:
 python -m venv venv
 .\venv\Scripts\activate
 pip install -r cv_pipeline/requirements.txt
+cd cv_pipeline
+python orchestrator.py
 ```
 
 ### macOS / Linux
@@ -314,106 +200,93 @@ pip install -r cv_pipeline/requirements.txt
 python -m venv venv
 source venv/bin/activate
 pip install -r cv_pipeline/requirements.txt
-```
-
-Then run:
-
-```bash
 cd cv_pipeline
 python orchestrator.py
 ```
 
 ---
 
-## 8. Docker Services
-
-The project uses Docker Compose for the API and dashboard.
+## 7. Docker Services
 
 ### `store-api`
 
 FastAPI backend.
 
-Exposes:
+URL:
 
 ```text
-localhost:8000
+http://localhost:8000
 ```
 
 Responsibilities:
 
-* Receives CV events
-* Validates event schema
-* Stores event records
-* Updates visitor sessions
-* Seeds POS transaction data
-* Correlates billing exits with POS transactions
-* Provides analytics endpoints
+* event ingestion
+* event normalization
+* event validation
+* duplicate idempotency
+* partial-success handling
+* event persistence
+* POS seeding
+* POS correlation
+* metrics
+* funnel
+* heatmap
+* anomalies
+* health monitoring
+* structured logging
 
 ### `store-dashboard`
 
-Streamlit frontend.
+Streamlit dashboard.
 
-Exposes:
+URL:
 
 ```text
-localhost:8501
+http://localhost:8501
 ```
 
-Responsibilities:
+Dashboard panels:
 
-* Polls API every few seconds
-* Displays KPIs
-* Displays conversion funnel
-* Displays queue abandonment insights
+* store selector
+* system health
+* North Star KPIs
+* queue/event KPIs
+* four-stage shopper funnel
+* queue insights
+* active anomalies
+* zone heatmap
+* average product-zone dwell
 
 ---
 
-## 9. API Endpoints
+## 8. API Endpoints
 
-### 9.1 Health
+### Health
 
 ```http
 GET /health
 ```
 
-Returns:
-
-* API status
-* Database connectivity
-* Latest event timestamp per store
-* Feed freshness status
-* Stale-feed warnings
-
-Example:
-
-```json
-{
-  "status": "healthy",
-  "database": {
-    "status": "connected"
-  },
-  "stores": {
-    "ST1008": {
-      "last_event_timestamp": "2026-04-10T10:05:00+00:00",
-      "feed_status": "OK",
-      "warnings": []
-    }
-  },
-  "warnings": []
-}
-```
+Returns API status, database status, latest event timestamp by store, and stale-feed warnings.
 
 ---
 
-### 9.2 Event Ingestion
+### Event Ingestion
 
 ```http
 POST /events/ingest
 ```
 
-Accepts a batch of up to 500 events.
+Accepts up to 500 events per request.
 
-Payload shape:
+Supports:
+
+```text
+canonical Event Schema v1.2
+sample_events.jsonl-style challenge payloads
+```
+
+Example canonical payload:
 
 ```json
 {
@@ -422,13 +295,13 @@ Payload shape:
       "event_id": "11111111-1111-4111-8111-111111111111",
       "store_id": "ST1008",
       "camera_id": "CAM_ENTRANCE",
-      "visitor_id": "VIS_1",
+      "visitor_id": "VIS_001",
       "timestamp": "2026-04-10T10:00:00Z",
       "event_type": "ENTRY",
       "zone_id": null,
       "dwell_ms": null,
       "is_staff": false,
-      "confidence": 0.92,
+      "confidence": 0.95,
       "metadata": {
         "queue_depth": null,
         "sku_zone": null,
@@ -452,11 +325,9 @@ Response:
 }
 ```
 
-The endpoint validates events individually. If one event in a batch is malformed, valid events are still processed and the response becomes `partial_success`.
-
 ---
 
-### 9.3 Store Metrics
+### Metrics
 
 ```http
 GET /stores/{store_id}/metrics
@@ -466,138 +337,81 @@ Example:
 
 ```text
 GET /stores/ST1008/metrics
+GET /stores/STORE_BLR_002/metrics
 ```
 
 Returns:
 
-```json
-{
-  "store_id": "ST1008",
-  "total_visitors": 14,
-  "converted_visitors": 3,
-  "conversion_rate_percentage": 21.43,
-  "current_queue_depth": 1,
-  "avg_queue_wait_ms": 42000.0,
-  "avg_dwell_ms_by_zone": {
-    "MAKEUP": 7200.0,
-    "SKINCARE": 6400.0
-  },
-  "total_events": 180,
-  "last_event_timestamp": "2026-04-10T10:20:00+00:00"
-}
+```text
+total_visitors
+converted_visitors
+conversion_rate_percentage
+current_queue_depth
+avg_queue_wait_ms
+avg_dwell_ms_by_zone
+total_events
+last_event_timestamp
 ```
+
+Unknown or empty stores return safe zero-state JSON.
 
 ---
 
-### 9.4 Funnel
+### Funnel
 
 ```http
 GET /stores/{store_id}/funnel
 ```
 
-Example:
+Challenge-aligned funnel:
 
 ```text
-GET /stores/ST1008/funnel
+Entered Store
+Visited Product Zone
+Entered Billing Queue
+Completed Purchase
 ```
 
-Returns:
+Returned keys:
 
-```json
-{
-  "store_id": "ST1008",
-  "funnel_steps": {
-    "1_entered_store": 14,
-    "2_entered_billing_queue": 6,
-    "3_completed_purchase": 3
-  },
-  "insights": {
-    "queue_abandonment_count": 3,
-    "queue_abandonment_rate": 50.0,
-    "avg_queue_wait_ms": 38800.0,
-    "completed_queue_cycles": 6,
-    "current_queue_depth": 0,
-    "queue_data_source": "event_stream"
-  }
-}
+```text
+1_entered_store
+2_visited_zone
+3_entered_billing_queue
+4_completed_purchase
 ```
 
-Queue analytics are derived from raw `BILLING_QUEUE_JOIN` and `BILLING_QUEUE_EXIT` events. This is intentional because full cross-camera Re-ID is not implemented yet.
+Backward-compatible keys are also preserved:
+
+```text
+2_entered_billing_queue
+3_completed_purchase
+```
 
 ---
 
-### 9.5 Heatmap
+### Heatmap
 
 ```http
 GET /stores/{store_id}/heatmap
 ```
 
-Example:
+Returns zone-level engagement:
 
 ```text
-GET /stores/ST1008/heatmap
+zone_id
+visit_count
+avg_dwell_ms
+heat_score
+data_confidence
 ```
-
-Returns:
-
-```json
-{
-  "store_id": "ST1008",
-  "heatmap_type": "zone_level",
-  "data_confidence": "LOW",
-  "zones": [
-    {
-      "zone_id": "MAKEUP",
-      "visit_count": 4,
-      "avg_dwell_ms": 6200.0,
-      "heat_score": 85.0
-    },
-    {
-      "zone_id": "SKINCARE",
-      "visit_count": 2,
-      "avg_dwell_ms": 4100.0,
-      "heat_score": 45.3
-    }
-  ]
-}
-```
-
-Heat score is normalized from 0 to 100 using visit count and average dwell time.
 
 ---
 
-### 9.6 Anomalies
+### Anomalies
 
 ```http
 GET /stores/{store_id}/anomalies
-```
-
-Example:
-
-```text
-GET /stores/ST1008/anomalies
-```
-
-Returns:
-
-```json
-{
-  "store_id": "ST1008",
-  "status": "WARN",
-  "anomalies": [
-    {
-      "type": "BILLING_QUEUE_SPIKE",
-      "severity": "WARN",
-      "message": "Current billing queue depth is 5.",
-      "suggested_action": "Open an additional billing counter or assign staff to checkout.",
-      "evidence": {
-        "current_queue_depth": 5,
-        "warn_threshold": 5,
-        "critical_threshold": 8
-      }
-    }
-  ]
-}
 ```
 
 Implemented anomaly types:
@@ -611,13 +425,9 @@ STALE_FEED
 
 ---
 
-## 10. Event Schema Version
+## 9. Event Schema v1.2
 
-The project uses **Event Schema v1.2**.
-
-It preserves the original flattened fields and adds nested metadata.
-
-### Core Fields
+Core fields:
 
 ```text
 event_id
@@ -633,7 +443,7 @@ confidence
 metadata
 ```
 
-### Metadata Fields
+Metadata fields:
 
 ```text
 metadata.queue_depth
@@ -641,7 +451,7 @@ metadata.sku_zone
 metadata.session_seq
 ```
 
-### Supported Event Types
+Supported event types:
 
 ```text
 ENTRY
@@ -651,119 +461,137 @@ ZONE_EXIT
 ZONE_DWELL
 BILLING_QUEUE_JOIN
 BILLING_QUEUE_EXIT
-REENTRY
 BILLING_QUEUE_ABANDON
+REENTRY
 ```
-
-Note: `REENTRY` and `BILLING_QUEUE_ABANDON` are supported by the API schema, but the current CV pipeline does not yet fully generate them.
 
 ---
 
-## 11. Database Design
+## 10. Sample Event Compatibility
 
-The backend uses SQLite through SQLAlchemy.
+The ingestion API includes a normalization adapter.
 
-SQLite was chosen for challenge reliability because it requires:
-
-```text
-no external database container
-no credentials
-no network DB dependency
-fast local startup
-simple reviewer setup
-```
-
-### Tables
-
-#### `events`
-
-Raw event stream.
-
-Stores:
+It maps challenge-style sample fields into the internal schema:
 
 ```text
-event_id
-store_id
-camera_id
-visitor_id
-event_type
-timestamp
-zone_id
-dwell_ms
-is_staff
-confidence
-queue_depth
-sku_zone
-session_seq
+id_token → visitor_id
+track_id → visitor_id
+store_code → store_id
+event_timestamp → timestamp
+event_time → timestamp
+queue_exit_ts → timestamp
+queue_served_ts → timestamp
+queue_join_ts → timestamp
+zone_entered → ZONE_ENTER
+zone_exited → ZONE_EXIT
+queue_completed → BILLING_QUEUE_EXIT
+queue_abandoned → BILLING_QUEUE_ABANDON
+queue_position_at_join → metadata.queue_depth
+zone_name → metadata.sku_zone
 ```
 
-#### `sessions`
+This allows the API to accept both canonical internal events and uploaded sample-event style payloads.
 
-Materialized visitor lifecycle table.
+---
 
-Stores:
+## 11. POS Data Compatibility
 
-```text
-visitor_id
-store_id
-entry_time
-last_seen_time
-billing_join_time
-billing_exit_time
-is_converted
-is_staff
-```
+The POS seeder supports two schemas.
 
-#### `pos_transactions`
-
-Seeded from the POS CSV.
-
-Stores:
+### Official-style schema
 
 ```text
 transaction_id
 store_id
 timestamp
 basket_value_inr
-claimed_by_visitor_id
+```
+
+### Uploaded/current schema
+
+```text
+order_id
+order_date
+order_time
+store_id
+total_amount
+```
+
+The parser:
+
+```text
+skips malformed rows
+deduplicates transaction IDs
+allows zero-value transactions
+returns a safe summary if the file is missing
 ```
 
 ---
 
-## 12. POS Correlation Logic
+## 12. Camera Mapping
 
-When the API receives a `BILLING_QUEUE_EXIT` event, it tries to match that visitor with a POS transaction.
-
-Rule:
+Current CV camera mapping is defined in:
 
 ```text
-Find an unclaimed POS transaction from the same store where:
-transaction timestamp is within 5 minutes before billing queue exit time
+cv_pipeline/orchestrator.py
 ```
 
-If found:
+Current video mapping:
 
 ```text
-pos_transactions.claimed_by_visitor_id = visitor_id
-sessions.is_converted = True
+CAM_ENTRANCE  → ../data/CAM_03.mp4
+CAM_BILLING   → ../data/CAM_05.mp4
+CAM_MAKEUP    → ../data/CAM_02.mp4
+CAM_SKINCARE  → ../data/CAM_01.mp4
 ```
 
-This prevents the same receipt from being counted multiple times.
+Run from inside `cv_pipeline/` so the relative paths resolve correctly.
 
 ---
 
-## 13. Staff Exclusion
+## 13. Zone Mapping
 
-The implemented staff exclusion strategy is spatial.
+Zone mapping is polygon-based.
+
+Helper tool:
+
+```text
+cv_pipeline/zone_mapper.py
+```
+
+It allows manual clicking of polygon points on the first frame of a video and prints OpenCV-compatible `np.array(...)` coordinates.
+
+Known limitation:
+
+```text
+If a camera angle changes, polygons must be recalibrated.
+```
+
+---
+
+## 14. Staff Exclusion
+
+Implemented strategy:
+
+```text
+behind-counter spatial heuristic
+```
 
 Rule:
 
 ```text
-If a tracked person remains inside the BEHIND_COUNTER polygon for more than 30 consecutive frames,
+If a person stays inside the BEHIND_COUNTER polygon for more than 30 consecutive frames,
 mark that visitor as staff.
 ```
 
-Staff events are excluded from customer analytics.
+Staff is excluded from:
+
+```text
+metrics
+funnel
+queue analytics
+heatmap
+```
 
 Known limitation:
 
@@ -771,77 +599,70 @@ Known limitation:
 Roaming floor staff may still be counted as customers.
 ```
 
-This is documented as a v1 limitation.
+---
+
+## 15. Queue Logic
+
+Queue events:
+
+```text
+BILLING_QUEUE_JOIN
+BILLING_QUEUE_EXIT
+BILLING_QUEUE_ABANDON
+```
+
+Computed metrics:
+
+```text
+current_queue_depth
+avg_queue_wait_ms
+completed_queue_cycles
+abandoned_queue_cycles
+queue_abandonment_count
+queue_abandonment_rate
+```
+
+Queue analytics are derived from the raw event stream, which is more reliable than global session state because full cross-camera Re-ID is not implemented.
 
 ---
 
-## 14. Zone Mapping
+## 16. Testing
 
-Zone mapping is based on manually calibrated polygons.
+Run:
 
-The helper utility:
-
-```text
-cv_pipeline/zone_mapper.py
+```bash
+pytest
 ```
 
-allows a developer to click points on a video frame and generate OpenCV-compatible polygon arrays.
-
-The final polygons are currently hardcoded into:
+Expected result after all phases:
 
 ```text
-cv_pipeline/orchestrator.py
+32 passed
 ```
 
-Known limitation:
+Test coverage includes:
 
 ```text
-If a camera moves, polygons must be recalibrated.
+health endpoint
+valid event ingestion
+duplicate idempotency
+partial-success ingestion
+sample-event normalization
+acceptance-gate store safety
+POS schema variants
+session-based funnel
+populated heatmap
+anomaly rules
+staff filtering
 ```
+
+The CV model pipeline is not unit-tested because YOLO/ByteTrack output depends on local video files, model behavior, and hardware.
 
 ---
 
-## 15. Dashboard
+## 17. Structured Logging
 
-The dashboard is built with Streamlit.
-
-Run through Docker Compose:
-
-```text
-http://localhost:8501
-```
-
-It displays:
-
-```text
-total visitors
-converted visitors
-conversion rate
-shopper funnel
-queue abandonment count
-queue abandonment rate
-```
-
-The dashboard polls:
-
-```text
-GET /stores/ST1008/metrics
-GET /stores/ST1008/funnel
-```
-
-The store ID is currently hardcoded as:
-
-```text
-ST1008
-```
-
----
-
-## 16. Structured Logging
-
-The API includes structured JSON-style request logging.
-
-Each request logs:
+Every API request logs JSON-style structured fields:
 
 ```text
 trace_id
@@ -853,7 +674,7 @@ store_id
 client_host
 ```
 
-For ingestion batches, the API also logs:
+Every ingestion batch additionally logs:
 
 ```text
 received_count
@@ -863,7 +684,7 @@ error_count
 status
 ```
 
-Every API response includes:
+Every response includes:
 
 ```text
 X-Trace-Id
@@ -871,218 +692,91 @@ X-Trace-Id
 
 ---
 
-## 17. Running Tests
+## 18. AI-Assisted Engineering
 
-The project includes a minimal API regression test suite using `pytest`.
-
-From the project root, install the API test dependencies:
-
-```bash
-pip install -r api/requirements.txt
-```
-
-Then run:
-
-```bash
-pytest
-```
-
-Expected result:
+AI assistance was used for:
 
 ```text
-8 passed
+architecture review
+risk prioritization
+event schema compatibility planning
+test expansion planning
+documentation review
 ```
 
-The tests cover:
-
-* API health endpoint
-* valid event ingestion
-* duplicate event idempotency
-* partial-success behavior for malformed events
-* empty-state metrics
-* empty-state funnel
-* empty-state heatmap
-* empty-state anomalies
-
-Each test file includes an AI prompt block and a human-change note, as expected by the challenge documentation.
-
-### Test Scope and Limitations
-
-The current test suite focuses on deterministic API and business-logic behavior. It does not test YOLOv8, ByteTrack, OpenCV video processing, or full multi-camera CV execution.
-
-Those components are validated manually by running:
-
-```bash
-cd cv_pipeline
-python orchestrator.py
-```
-
-This split is intentional: API regression tests provide fast, reliable validation, while CV model behavior depends on video files, local hardware, and non-deterministic tracking output.
-
----
-
-## 18. Manual Validation Checklist
-
-After setup, validate the system in this order.
-
-### 18.1 Start cloud layer
-
-```bash
-docker compose up --build
-```
-
-Confirm:
+Important decisions documented in `DESIGN.md` and `CHOICES.md`:
 
 ```text
-store-api starts
-store-dashboard starts
-API healthcheck passes
-```
-
-### 18.2 Check API endpoints
-
-Open:
-
-```text
-http://localhost:8000/health
-http://localhost:8000/stores/ST1008/metrics
-http://localhost:8000/stores/ST1008/funnel
-http://localhost:8000/stores/ST1008/heatmap
-http://localhost:8000/stores/ST1008/anomalies
-```
-
-### 18.3 Open dashboard
-
-Open:
-
-```text
-http://localhost:8501
-```
-
-### 18.4 Run CV pipeline
-
-In another terminal:
-
-```bash
-cd cv_pipeline
-python orchestrator.py
-```
-
-### 18.5 Watch dashboard update
-
-Expected behavior:
-
-```text
-total events increase
-visitor count increases
-queue/funnel metrics update
-dashboard refreshes automatically
+event normalization adapter accepted
+event-derived queue analytics accepted
+four-stage funnel accepted
+full Re-ID deferred
+full CV Dockerization deferred
 ```
 
 ---
 
 ## 19. Known Limitations
 
-The current implementation is submission-focused and intentionally pragmatic.
-
-Known limitations:
-
 1. Full cross-camera Re-ID is not implemented.
-2. OSNet/TorchReID is documented as a future improvement, not current code.
-3. `REENTRY` is supported in the API schema but not fully emitted by the CV pipeline.
-4. `BILLING_QUEUE_ABANDON` is computed as an aggregate, not emitted as a discrete CV event.
-5. CV pipeline runs locally, outside default Docker Compose.
-6. Camera polygons are manually calibrated and hardcoded.
-7. Visitor IDs are ByteTrack-local, not globally stable across cameras.
-8. SQLite is used for challenge simplicity; PostgreSQL is recommended for production.
-9. Dashboard uses polling rather than WebSockets.
-10. CV tests are manual rather than automated.
+2. ByteTrack IDs are camera-local.
+3. CV pipeline runs locally outside Docker.
+4. Camera polygons are manually calibrated and hardcoded.
+5. `REENTRY` is schema-supported but not robustly emitted by CV.
+6. `ZONE_DWELL` cadence may not fully satisfy every-30-second production behavior.
+7. SQLite is used instead of PostgreSQL.
+8. Dashboard uses polling, not WebSockets.
+9. Roaming staff may still be counted as customers.
+10. CV processing may be slow on CPU.
 
 ---
 
 ## 20. Production Improvements
 
-For production deployment, the next improvements would be:
+Recommended next steps for production:
 
 ```text
-Migrate SQLite to PostgreSQL
-Add Alembic migrations
-Add full Re-ID service using OSNet or similar embeddings
-Add camera configuration API instead of hardcoded polygons
-Add persistent edge event buffer / DLQ
-Containerize CV worker with an optional CPU/GPU profile
-Add WebSocket or SSE dashboard updates
-Add structured log aggregation
-Add OpenTelemetry tracing
-Add full CV state-machine tests
-Add load tests for event ingestion
+PostgreSQL migration
+Alembic migrations
+global Re-ID service
+camera configuration API
+persistent edge event buffer
+optional CV Docker profile
+concurrent multi-camera processing
+WebSocket/SSE dashboard updates
+OpenTelemetry tracing
+CV state-machine tests
 ```
 
 ---
 
-## 21. Git Workflow Used
+## 21. Final Submission Status
 
-Recommended branch naming:
-
-```text
-docs/acceptance-gate-foundation
-feature/event-schema-v1-2
-feature/full-event-persistence
-feature/robust-event-ingestion
-feature/health-feed-status
-feature/expanded-store-metrics
-feature/zone-heatmap-endpoint
-feature/event-derived-queue-funnel
-feature/anomaly-detection-endpoint
-feature/structured-api-logging
-test/minimal-api-regression-suite
-```
-
-Recommended commit style:
+Current status:
 
 ```text
-docs: add acceptance gate documentation and run checklist
-feat: add event metadata schema and session sequence fields
-feat: persist full event schema fields in database
-feat: add partial success handling for event ingestion
-feat: add feed freshness status to health endpoint
-feat: add queue depth and dwell metrics
-feat: add zone heatmap endpoint
-feat: compute queue funnel metrics from event stream
-feat: add rule-based anomaly detection endpoint
-feat: add structured request logging middleware
-test: add minimal API regression tests
+READY FOR SUBMISSION WITH DOCUMENTED LIMITATIONS
 ```
 
----
-
-## 22. Final Submission Status
-
-Current implementation status:
+Strong points:
 
 ```text
-API containerized: yes
-Dashboard containerized: yes
-CV pipeline implemented: yes, host-side
-Event ingestion: yes
-Event schema metadata: yes
-Full event persistence: yes
-Metrics endpoint: yes
-Funnel endpoint: yes
-Heatmap endpoint: yes
-Anomalies endpoint: yes
-Health endpoint: yes
-Structured logging: yes
-Minimal tests: yes
-README: yes
-DESIGN.md: yes
-CHOICES.md: yes
+Dockerized API and dashboard
+robust event ingestion
+sample event compatibility
+dual POS parser
+session-based funnel
+heatmap endpoint
+anomaly endpoint
+structured logging
+expanded pytest suite
+reviewer-friendly documentation
 ```
 
-Current readiness:
+Main limitations:
 
 ```text
-PARTIALLY READY TO READY FOR SUBMISSION
+no full cross-camera Re-ID
+CV worker outside Docker
+manual polygon calibration
 ```
-
-The remaining major weakness is the absence of full cross-camera Re-ID and fully containerized CV execution.

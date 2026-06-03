@@ -2,77 +2,13 @@
 
 # Retail Store Intelligence Platform — Submission Checklist
 
-This checklist summarizes the final implementation status and reviewer run instructions.
+This file summarizes the current implementation status and reviewer commands.
 
 ---
 
-## 1. Acceptance Gate
+## 1. Quick Run Commands
 
-## Docker Compose
-
-Status:
-
-```text
-PASS
-```
-
-Command:
-
-```bash
-docker compose up --build
-```
-
-Expected services:
-
-```text
-store-api
-store-dashboard
-```
-
-Expected URLs:
-
-```text
-http://localhost:8000/health
-http://localhost:8501
-```
-
-Notes:
-
-The API and dashboard are containerized. The CV pipeline is run locally as a host-side edge process.
-
----
-
-## 2. Required Data Placement
-
-Before running the full system, create:
-
-```text
-data/
-```
-
-Expected files:
-
-```text
-data/Brigade_Bangalore_10_April_26.csv
-data/CAM_01.mp4
-data/CAM_02.mp4
-data/CAM_03.mp4
-data/CAM_05.mp4
-```
-
-The POS CSV is mounted into the API container at:
-
-```text
-/app/data/Brigade_Bangalore_10_April_26.csv
-```
-
----
-
-## 3. Reviewer Run Commands
-
-## Step 1: Start API and Dashboard
-
-From project root:
+### Start API and Dashboard
 
 ```bash
 docker compose up --build
@@ -85,16 +21,16 @@ http://localhost:8000/health
 http://localhost:8501
 ```
 
-## Step 2: Run CV Pipeline
+### Run CV Pipeline
 
-In a second terminal:
+In another terminal:
 
 ```bash
 cd cv_pipeline
 python orchestrator.py
 ```
 
-## Step 3: Run Tests
+### Run Tests
 
 From project root:
 
@@ -102,17 +38,53 @@ From project root:
 pytest
 ```
 
-Expected result:
+---
+
+## 2. Data Placement
+
+Expected project structure:
 
 ```text
-8 passed
+retail-store-intelligence/
+└── data/
+    ├── Brigade_Bangalore_10_April_26.csv
+    ├── CAM_01.mp4
+    ├── CAM_02.mp4
+    ├── CAM_03.mp4
+    └── CAM_05.mp4
 ```
+
+The API seeds POS data from:
+
+```text
+/app/data/Brigade_Bangalore_10_April_26.csv
+```
+
+inside the Docker container.
+
+---
+
+## 3. Acceptance Gate Status
+
+| Requirement                                                   | Status                |
+| ------------------------------------------------------------- | --------------------- |
+| Docker Compose starts API                                     | Implemented           |
+| Docker Compose starts dashboard                               | Implemented           |
+| `/health` returns valid JSON                                  | Implemented           |
+| `/stores/ST1008/metrics` returns valid JSON                   | Implemented           |
+| `/stores/STORE_BLR_002/metrics` returns valid zero-state JSON | Implemented / tested  |
+| Event ingestion works                                         | Implemented           |
+| Duplicate event idempotency                                   | Implemented / tested  |
+| Partial-success ingestion                                     | Implemented / tested  |
+| Dashboard available at port 8501                              | Implemented           |
+| CV pipeline runnable                                          | Implemented host-side |
+| Full CV containerization                                      | Not implemented       |
 
 ---
 
 ## 4. API Endpoints
 
-## Health
+### Health
 
 ```text
 GET /health
@@ -129,14 +101,14 @@ Reports:
 ```text
 API status
 database status
-latest event timestamp
+latest event timestamp by store
 feed freshness
 warnings
 ```
 
 ---
 
-## Event Ingestion
+### Event Ingestion
 
 ```text
 POST /events/ingest
@@ -152,16 +124,24 @@ Features:
 
 ```text
 batch ingestion
-max 500 events
-per-event validation
-partial success handling
-duplicate event idempotency
+maximum 500 events
+event normalization
+Pydantic validation
+duplicate idempotency
+partial success
 structured response counters
+```
+
+Supports both:
+
+```text
+canonical Event Schema v1.2
+sample_events.jsonl-style payloads
 ```
 
 ---
 
-## Metrics
+### Metrics
 
 ```text
 GET /stores/{store_id}/metrics
@@ -188,7 +168,7 @@ last_event_timestamp
 
 ---
 
-## Funnel
+### Funnel
 
 ```text
 GET /stores/{store_id}/funnel
@@ -200,22 +180,25 @@ Status:
 IMPLEMENTED
 ```
 
-Returns:
+Challenge-aligned stages:
 
 ```text
-entered store
-entered billing queue
-completed purchase
-queue abandonment count
-queue abandonment rate
-average queue wait
-completed queue cycles
-current queue depth
+1_entered_store
+2_visited_zone
+3_entered_billing_queue
+4_completed_purchase
+```
+
+Backward-compatible keys preserved:
+
+```text
+2_entered_billing_queue
+3_completed_purchase
 ```
 
 ---
 
-## Heatmap
+### Heatmap
 
 ```text
 GET /stores/{store_id}/heatmap
@@ -230,15 +213,16 @@ IMPLEMENTED
 Returns:
 
 ```text
-zone visit counts
-average dwell by zone
-heat score
-data confidence
+zone_id
+visit_count
+avg_dwell_ms
+heat_score
+data_confidence
 ```
 
 ---
 
-## Anomalies
+### Anomalies
 
 ```text
 GET /stores/{store_id}/anomalies
@@ -261,105 +245,12 @@ STALE_FEED
 
 ---
 
-## 5. Dashboard
+## 5. Event Schema
 
-URL:
-
-```text
-http://localhost:8501
-```
-
-Status:
-
-```text
-IMPLEMENTED
-```
-
-Dashboard panels:
-
-```text
-System Health
-North Star KPIs
-Queue and Event KPIs
-Shopper Funnel
-Queue Insights
-Active Anomalies
-Zone Heatmap
-Average Product-Zone Dwell
-```
-
-Dashboard calls:
-
-```text
-GET /health
-GET /stores/ST1008/metrics
-GET /stores/ST1008/funnel
-GET /stores/ST1008/heatmap
-GET /stores/ST1008/anomalies
-```
-
----
-
-## 6. Computer Vision Pipeline
-
-Entrypoint:
-
-```text
-cv_pipeline/orchestrator.py
-```
-
-Run:
-
-```bash
-cd cv_pipeline
-python orchestrator.py
-```
-
-Status:
-
-```text
-IMPLEMENTED
-```
-
-Implemented CV components:
-
-```text
-YOLOv8n person detection
-ByteTrack local tracking
-bottom-center point extraction
-polygon zone detection
-behind-counter staff heuristic
-billing queue join/exit events
-zone dwell events
-batched API emission
-```
-
-Known issue:
-
-```text
-Processing may be slow on CPU because YOLO inference runs frame by frame.
-```
-
-Current decision:
-
-```text
-Keep as-is for submission stability.
-```
-
----
-
-## 7. Event Schema
-
-Schema version:
+Internal canonical schema:
 
 ```text
 Event Schema v1.2
-```
-
-Status:
-
-```text
-IMPLEMENTED
 ```
 
 Core fields:
@@ -378,7 +269,7 @@ confidence
 metadata
 ```
 
-Metadata fields:
+Metadata:
 
 ```text
 queue_depth
@@ -396,31 +287,83 @@ ZONE_EXIT
 ZONE_DWELL
 BILLING_QUEUE_JOIN
 BILLING_QUEUE_EXIT
-REENTRY
 BILLING_QUEUE_ABANDON
-```
-
-Important limitation:
-
-```text
-REENTRY is schema-supported but not emitted.
-BILLING_QUEUE_ABANDON is calculated as an aggregate, not emitted as a CV event.
+REENTRY
 ```
 
 ---
 
-## 8. Database
+## 6. Sample Event Compatibility
 
-Database:
+Status:
 
 ```text
-SQLite
+IMPLEMENTED
 ```
 
-ORM:
+The API normalizes fields such as:
 
 ```text
-SQLAlchemy
+id_token → visitor_id
+track_id → visitor_id
+store_code → store_id
+event_timestamp/event_time → timestamp
+zone_entered → ZONE_ENTER
+zone_exited → ZONE_EXIT
+queue_completed → BILLING_QUEUE_EXIT
+queue_abandoned → BILLING_QUEUE_ABANDON
+```
+
+This protects ingestion against uploaded challenge sample-event formats.
+
+---
+
+## 7. POS Compatibility
+
+Status:
+
+```text
+IMPLEMENTED
+```
+
+Supported POS formats:
+
+### Official-style format
+
+```text
+transaction_id
+store_id
+timestamp
+basket_value_inr
+```
+
+### Uploaded/current format
+
+```text
+order_id
+order_date
+order_time
+store_id
+total_amount
+```
+
+The parser:
+
+```text
+skips malformed rows
+deduplicates transaction IDs
+supports zero-value transactions
+returns safe summary for missing files
+```
+
+---
+
+## 8. Dashboard
+
+URL:
+
+```text
+http://localhost:8501
 ```
 
 Status:
@@ -429,94 +372,76 @@ Status:
 IMPLEMENTED
 ```
 
-Tables:
+Dashboard panels:
 
 ```text
-events
-sessions
-pos_transactions
+store selector
+system health
+North Star KPIs
+queue and event KPIs
+four-stage funnel
+queue insights
+active anomalies
+zone heatmap
+average product-zone dwell
 ```
 
-Implemented persistence:
+Supported store selector options:
 
 ```text
-full Event Schema v1.2 fields
-visitor session state
-POS transactions
-POS claim status
+ST1008
+STORE_BLR_002
+ST1076
+store_1076
+```
+
+---
+
+## 9. Computer Vision Pipeline
+
+Entrypoint:
+
+```text
+cv_pipeline/orchestrator.py
+```
+
+Run:
+
+```bash
+cd cv_pipeline
+python orchestrator.py
+```
+
+Status:
+
+```text
+IMPLEMENTED HOST-SIDE
+```
+
+Implemented CV components:
+
+```text
+YOLOv8n person detection
+ByteTrack local tracking
+bottom-center point extraction
+polygon zone detection
+behind-counter staff heuristic
+billing queue join/exit events
+zone dwell events
+batched API event emission
 ```
 
 Known limitation:
 
 ```text
-SQLite is not ideal for production multi-camera write-heavy workloads.
-```
-
-Production recommendation:
-
-```text
-PostgreSQL + Alembic migrations
+CV runs outside Docker.
+Processing can be slow on CPU.
+Full cross-camera Re-ID is not implemented.
 ```
 
 ---
 
-## 9. POS Correlation
-
-Status:
-
-```text
-IMPLEMENTED
-```
-
-Rule:
-
-```text
-When BILLING_QUEUE_EXIT arrives, find an unclaimed POS transaction from the same store within the previous 5 minutes.
-```
-
-If matched:
-
-```text
-mark transaction as claimed
-mark visitor session as converted
-```
-
-Known limitation:
-
-```text
-Reliability depends on visitor identity stability in the billing camera.
-```
-
----
-
-## 10. Queue Logic
-
-Status:
-
-```text
-IMPLEMENTED
-```
-
-Queue events:
-
-```text
-BILLING_QUEUE_JOIN
-BILLING_QUEUE_EXIT
-```
-
-Queue analytics source:
-
-```text
-event stream
-```
-
-Reason:
-
-Raw billing queue events are more reliable for queue metrics than cross-camera session state because full Re-ID is not implemented.
-
----
-
-## 11. Staff Exclusion
+## 10. Staff Exclusion
 
 Status:
 
@@ -530,48 +455,84 @@ Method:
 Behind-counter spatial heuristic
 ```
 
-Rule:
+Staff events are excluded from:
 
 ```text
-More than 30 consecutive frames inside BEHIND_COUNTER → is_staff=True
+metrics
+funnel
+heatmap
+queue analytics
 ```
 
 Known limitation:
 
 ```text
-Roaming floor staff may not be excluded.
+Roaming staff may still be counted as customers.
 ```
 
 ---
 
-## 12. Re-ID and Re-entry
+## 11. Queue Logic
 
-Global Re-ID:
-
-```text
-NOT IMPLEMENTED
-```
-
-REENTRY events:
+Status:
 
 ```text
-NOT EMITTED
+IMPLEMENTED
 ```
 
-Planned future design:
+Queue events:
 
 ```text
-OSNet / TorchReID embeddings
-cosine similarity
-global visitor ID pool
-cross-camera identity stitching
+BILLING_QUEUE_JOIN
+BILLING_QUEUE_EXIT
+BILLING_QUEUE_ABANDON
 ```
 
-Reason deferred:
+Computed metrics:
 
 ```text
-High dependency and implementation risk within challenge timeline.
+current_queue_depth
+avg_queue_wait_ms
+completed_queue_cycles
+abandoned_queue_cycles
+queue_abandonment_count
+queue_abandonment_rate
 ```
+
+---
+
+## 12. Testing Status
+
+Test framework:
+
+```text
+pytest
+```
+
+Test areas:
+
+```text
+health
+event ingestion
+duplicate idempotency
+partial success
+sample-event normalization
+acceptance-gate store safety
+POS schema variants
+session-based funnel
+populated heatmap
+average dwell
+anomaly rules
+staff filtering
+```
+
+After Phase 5, expected test count:
+
+```text
+32 passed
+```
+
+If some optional phases were skipped, the count may be lower, but all included tests should pass.
 
 ---
 
@@ -583,7 +544,7 @@ Status:
 IMPLEMENTED
 ```
 
-Structured request logging fields:
+Structured request log fields:
 
 ```text
 trace_id
@@ -595,7 +556,7 @@ store_id
 client_host
 ```
 
-Ingestion batch logging fields:
+Ingest batch log fields:
 
 ```text
 received_count
@@ -613,145 +574,80 @@ X-Trace-Id
 
 ---
 
-## 14. Automated Tests
+## 14. AI-Assisted Decisions
 
 Status:
 
 ```text
-IMPLEMENTED
+DOCUMENTED
 ```
 
-Test framework:
+See:
 
 ```text
-pytest
-```
-
-Run:
-
-```bash
-pytest
-```
-
-Current result:
-
-```text
-8 passed
-```
-
-Test files:
-
-```text
-tests/test_health.py
-tests/test_ingest.py
-tests/test_metrics.py
-tests/test_funnel.py
-tests/test_heatmap.py
-tests/test_anomalies.py
-```
-
-Coverage focus:
-
-```text
-API health
-valid event ingestion
-duplicate idempotency
-malformed event partial success
-empty metrics
-empty funnel
-empty heatmap
-empty anomalies
-```
-
-Known limitation:
-
-```text
-No automated YOLO/ByteTrack video tests.
-```
-
-Reason:
-
-CV output depends on video data, model behavior, and local hardware.
-
----
-
-## 15. Documentation
-
-Status:
-
-```text
-IMPLEMENTED
-```
-
-Docs included:
-
-```text
-README.md
 DESIGN.md
 CHOICES.md
-SUBMISSION_CHECKLIST.md
 ```
 
-Docs honestly describe:
+Important AI-assisted decisions documented:
 
 ```text
-implemented features
-known limitations
-reviewer commands
-architecture decisions
-testing status
-deployment trade-offs
+event normalization adapter accepted
+event-derived queue analytics accepted
+session-based funnel accepted
+full Re-ID deferred
+full CV Dockerization deferred
 ```
 
 ---
 
-## 16. Final Feature Status
+## 15. Final Feature Status
 
-| Feature | Status |
-|---|---|
-| Dockerized API | Implemented |
-| Dockerized dashboard | Implemented |
-| Host-side CV worker | Implemented |
-| YOLOv8n detection | Implemented |
-| ByteTrack tracking | Implemented |
-| Polygon zones | Implemented |
-| Staff exclusion | Implemented |
-| Event Schema v1.2 | Implemented |
-| Full event persistence | Implemented |
-| Robust ingestion | Implemented |
-| POS correlation | Implemented |
-| Metrics endpoint | Implemented |
-| Funnel endpoint | Implemented |
-| Heatmap endpoint | Implemented |
-| Anomalies endpoint | Implemented |
-| Health endpoint | Implemented |
-| Structured logging | Implemented |
-| Dashboard upgrade | Implemented |
-| Pytest suite | Implemented |
-| Cross-camera Re-ID | Not implemented |
-| REENTRY emission | Not implemented |
-| Fully Dockerized CV | Not implemented |
+| Feature                    | Status          |
+| -------------------------- | --------------- |
+| Dockerized API             | Implemented     |
+| Dockerized dashboard       | Implemented     |
+| Host-side CV worker        | Implemented     |
+| YOLOv8n detection          | Implemented     |
+| ByteTrack tracking         | Implemented     |
+| Polygon zones              | Implemented     |
+| Staff exclusion            | Implemented     |
+| Event Schema v1.2          | Implemented     |
+| Sample event normalization | Implemented     |
+| Full event persistence     | Implemented     |
+| POS dual schema parser     | Implemented     |
+| POS correlation            | Implemented     |
+| Metrics endpoint           | Implemented     |
+| Four-stage funnel endpoint | Implemented     |
+| Heatmap endpoint           | Implemented     |
+| Anomaly endpoint           | Implemented     |
+| Health endpoint            | Implemented     |
+| Structured logging         | Implemented     |
+| Dashboard upgrade          | Implemented     |
+| Pytest suite               | Implemented     |
+| Cross-camera Re-ID         | Not implemented |
+| Fully Dockerized CV        | Not implemented |
 
 ---
 
-## 17. Known Limitations
+## 16. Known Limitations
 
 1. CV pipeline runs locally outside Docker.
 2. Cross-camera Re-ID is not implemented.
 3. ByteTrack IDs are camera-local.
-4. `REENTRY` events are not emitted.
-5. `BILLING_QUEUE_ABANDON` is aggregate-derived, not emitted.
-6. Camera polygons are manually calibrated and hardcoded.
+4. Camera polygons are manually calibrated and hardcoded.
+5. `REENTRY` is schema-supported but not robustly emitted by CV.
+6. `ZONE_DWELL` cadence may not fully satisfy every-30-second production behavior.
 7. SQLite is used instead of PostgreSQL.
-8. CV processing may be slow on CPU.
-9. Dashboard uses polling.
-10. Roaming staff may be counted as customers.
+8. Dashboard uses polling, not WebSockets.
+9. Roaming staff may still be counted as customers.
+10. CV processing may be slow on CPU.
 
 ---
 
-## 18. Final Submission Confidence
+## 17. Final Submission Confidence
 
-Current readiness:
+Current status:
 
 ```text
 READY FOR SUBMISSION WITH DOCUMENTED LIMITATIONS
@@ -761,19 +657,20 @@ Strong points:
 
 ```text
 API works
-Docker works
+Docker works for API/dashboard
 Dashboard works
-Tests pass
-Endpoints are complete
-Structured logging exists
+Event ingestion is robust
+Sample events are normalized
+POS schema variants are supported
+Metrics/funnel/heatmap/anomalies are implemented
+Tests cover key edge cases
 Documentation is honest
 ```
 
-Main weakness:
+Main limitations:
 
 ```text
 No global cross-camera Re-ID
 CV worker outside Docker
+Manual polygon calibration
 ```
-
-These limitations are explicitly documented and defensible as challenge-time trade-offs.

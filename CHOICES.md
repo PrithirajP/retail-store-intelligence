@@ -2,64 +2,30 @@
 
 # Engineering Choices and Trade-offs
 
-This document explains the major engineering decisions made during the implementation of the Retail Store Intelligence Platform.
+This document records the major engineering decisions made during the Retail Store Intelligence Platform implementation.
 
-The project was built under challenge-style constraints, so decisions prioritize:
+The project was implemented under challenge-style constraints, so decisions prioritize:
 
-```text
-acceptance-gate reliability
-implementation speed
-reviewer confidence
-business usefulness
-interview defensibility
-```
+* acceptance-gate reliability
+* reviewer confidence
+* implementation simplicity
+* production-oriented reasoning
+* business usefulness
 
 ---
 
-# Decision 1: Detection Model
+## Decision 1 — Detection Model
 
-## Alternatives Considered
+### Alternatives considered
 
-### MediaPipe Object Detection
+```text
+MediaPipe Object Detection
+Faster R-CNN
+YOLOv10 / YOLOv11
+YOLOv8n
+```
 
-Pros:
-
-- Lightweight
-- CPU friendly
-- Easy to run locally
-
-Cons:
-
-- Less mature for multi-person CCTV retail scenes
-- Tracking integration less direct
-- Less flexible for challenge-style CV pipelines
-
-### Faster R-CNN
-
-Pros:
-
-- Strong accuracy
-- Good for complex object detection
-
-Cons:
-
-- Too slow for CPU-first edge processing
-- Heavy dependency footprint
-- Overkill for person-only detection
-
-### YOLOv10 / YOLOv11
-
-Pros:
-
-- Newer model families
-- Strong detection performance
-
-Cons:
-
-- More uncertainty around ecosystem maturity
-- More risk under time constraints
-
-## Decision
+### Decision
 
 Use:
 
@@ -67,74 +33,40 @@ Use:
 YOLOv8n
 ```
 
-## Rationale
+### Rationale
 
-YOLOv8n provides the best balance between:
+YOLOv8n gives a strong balance of speed, simplicity, and adequate person-detection quality for challenge-scale retail analytics.
 
-- Detection quality
-- Speed
-- Simplicity
-- Ultralytics ecosystem support
-- ByteTrack integration
+It also integrates easily with Ultralytics tracking.
 
-## Trade-off
+### Trade-off
 
-Choosing the nano model sacrifices some accuracy, especially in:
+The nano model is less accurate than heavier models in:
 
-- Occlusion
-- Low light
-- Distant shoppers
-- Crowded scenes
+* occlusion
+* distant shoppers
+* poor lighting
+* crowded frames
 
-## Interview Defense
+### Interview defense
 
-I chose YOLOv8n because the challenge needed a working end-to-end system, not a benchmark-winning detector. In retail analytics, stable approximate trends are often more useful than perfect frame-level detection if the system is reliable and cheap to deploy.
+The challenge required a working end-to-end system, not only a high-accuracy detector. YOLOv8n makes the edge pipeline feasible on CPU-class machines and allows more effort to be spent on event processing, API correctness, and analytics.
 
 ---
 
-# Decision 2: Tracking Model
+## Decision 2 — Tracking Model
 
-## Alternatives Considered
+### Alternatives considered
 
-### SORT
+```text
+SORT
+DeepSORT
+BoT-SORT
+StrongSORT
+ByteTrack
+```
 
-Pros:
-
-- Simple
-- Fast
-
-Cons:
-
-- Drops identities easily when detections are weak
-- Poor occlusion handling
-
-### DeepSORT
-
-Pros:
-
-- Adds appearance features
-- Better identity retention than SORT
-
-Cons:
-
-- More compute
-- More complexity
-- Extra model dependency
-
-### BoT-SORT / StrongSORT
-
-Pros:
-
-- Stronger tracking performance
-- Better ID consistency
-
-Cons:
-
-- Heavier implementation
-- More compute overhead
-- More risk in short challenge timeline
-
-## Decision
+### Decision
 
 Use:
 
@@ -142,194 +74,106 @@ Use:
 ByteTrack
 ```
 
-## Rationale
+### Rationale
 
-ByteTrack was selected because it handles low-confidence detections better than simpler trackers. This is useful in retail stores where customers are partially occluded by shelves, counters, or other shoppers.
+ByteTrack handles low-confidence detections better than SORT and avoids the extra model/dependency overhead of DeepSORT or StrongSORT.
 
-## Trade-off
+### Trade-off
 
-ByteTrack only provides local camera tracking. It does not solve cross-camera identity.
+ByteTrack gives local camera tracking only. It does not solve global cross-camera identity.
 
-## Interview Defense
+### Interview defense
 
-ByteTrack gives strong local tracking for low implementation cost. I used it to make zone and queue events stable enough for analytics, while leaving a clear future path for Re-ID.
+ByteTrack is a strong local tracker for a time-limited implementation. It gives stable enough IDs for zone and queue analytics while leaving a clean upgrade path to Re-ID.
 
 ---
 
-# Decision 3: Re-ID Strategy
+## Decision 3 — Re-ID Strategy
 
-## Alternatives Considered
+### Previous ideal
 
-### Full OSNet / TorchReID Implementation
+Implement full OSNet/TorchReID-based global identity.
 
-Pros:
+### Issue
 
-- Cross-camera identity
-- Enables REENTRY detection
-- Improves true visitor uniqueness
+Full Re-ID would require:
 
-Cons:
+* crop extraction
+* second model inference
+* embedding storage
+* similarity thresholding
+* cross-camera state management
+* tuning and validation
 
-- Extra model integration
-- Additional inference cost
-- Dependency risk
-- Threshold tuning required
-- Hard to validate quickly
-
-### Simple Color Histogram Re-ID
-
-Pros:
-
-- Easy to implement
-- Low compute
-
-Cons:
-
-- Weak accuracy
-- Sensitive to lighting
-- Poor robustness
-
-## Previous Decision
-
-Implement OSNet/TorchReID for global identity.
-
-## Issue
-
-This created too much implementation and dependency risk for the challenge timeline.
-
-## Recommended Decision
+### Decision
 
 Defer full Re-ID.
 
-Implemented identity strategy:
+Current implementation:
 
 ```text
 ByteTrack-local visitor IDs
 ```
 
-## Rationale
+### Rationale
 
-The project needed a working API, event pipeline, database, dashboard, and metrics. Re-ID would have consumed too much implementation time and increased the risk of an unstable submission.
+Completing API ingestion, database persistence, POS correlation, dashboard, and tests was higher priority than adding a partially reliable Re-ID layer.
 
-## Implementation Impact
+### Trade-off
 
-Affected files:
+A shopper crossing cameras may be counted more than once.
 
-```text
-cv_pipeline/detector.py
-cv_pipeline/orchestrator.py
-cv_pipeline/tracker_state.py
-```
+### Interview defense
 
-No `reid.py` module is currently implemented.
-
-## Score Impact
-
-This loses points for cross-camera identity and REENTRY handling, but preserves acceptance-gate reliability and overall system completeness.
-
-## Interview Defense
-
-I made a deliberate trade-off: implement the full analytics pipeline first, and leave Re-ID as a clean future extension. A half-built Re-ID system would be worse than a stable system with clearly documented identity limitations.
+A weak Re-ID system can damage funnel accuracy more than no Re-ID. The implementation documents this limitation honestly and keeps the architecture ready for a future Re-ID module.
 
 ---
 
-# Decision 4: Zone Detection Strategy
+## Decision 4 — Zone Detection
 
-## Alternatives Considered
+### Alternatives considered
 
-### Object-center zone detection
+```text
+center point of bounding box
+bottom-center point of bounding box
+semantic segmentation
+homography-based floor projection
+```
 
-Pros:
-
-- Easy
-
-Cons:
-
-- Inaccurate for CCTV perspective
-- Person’s upper body may overlap shelves while feet are elsewhere
-
-### Segmentation-based floor mapping
-
-Pros:
-
-- More sophisticated
-
-Cons:
-
-- Requires more data
-- Harder to calibrate
-- Too complex for challenge timeline
-
-## Decision
+### Decision
 
 Use:
 
 ```text
-bottom-center point of bounding box + polygon hit test
+bottom-center point + polygon hit test
 ```
 
-## Rationale
+### Rationale
 
-The bottom-center of the bounding box better approximates where the person is standing on the floor.
+The bottom-center point better represents the person’s physical floor position in CCTV footage.
 
-## Trade-off
+### Trade-off
 
-Polygon boundaries can flicker if the detected foot point jitters near the edge.
+Manual polygons are sensitive to camera drift and must be recalibrated if cameras move.
 
-## Future Improvement
+### Interview defense
 
-Add hysteresis/debounce:
-
-```text
-must remain inside/outside for N frames before firing enter/exit
-```
-
-## Interview Defense
-
-Polygon-based zone detection is simple, fast, explainable, and appropriate for manually calibrated CCTV analytics.
+Manual polygon zones are simple, explainable, fast, and appropriate for a challenge implementation.
 
 ---
 
-# Decision 5: Staff Detection
+## Decision 5 — Staff Detection
 
-## Alternatives Considered
+### Alternatives considered
 
-### Uniform color masking
+```text
+uniform color masking
+custom staff classifier
+face-based recognition
+behind-counter heuristic
+```
 
-Pros:
-
-- Easy to implement
-
-Cons:
-
-- Brittle under lighting changes
-- False positives for customers wearing similar colors
-
-### Custom staff classifier
-
-Pros:
-
-- More accurate if trained well
-
-Cons:
-
-- Requires labeled data
-- Additional model complexity
-- Extra inference cost
-
-### Face blur / face detection artifact
-
-Pros:
-
-- Might work on sample data if staff/customer anonymization differs
-
-Cons:
-
-- Dataset leak
-- Not robust
-- Ethically and technically weak
-
-## Decision
+### Decision
 
 Use:
 
@@ -337,36 +181,29 @@ Use:
 behind-counter spatial heuristic
 ```
 
-## Rule
+### Rationale
 
-```text
-If a person stays inside BEHIND_COUNTER for more than 30 consecutive frames,
-mark as staff.
-```
+Cashiers are the biggest source of staff noise in queue analytics. The behind-counter heuristic removes that noise with almost no compute cost.
 
-## Rationale
+### Trade-off
 
-Cashiers create the largest staff-noise problem in queue analytics. The behind-counter heuristic removes that noise with almost zero compute overhead.
+Roaming floor staff may still be counted as shoppers.
 
-## Trade-off
+### Interview defense
 
-Roaming staff may still be counted as customers.
-
-## Interview Defense
-
-This is an 80/20 production choice: remove the highest-impact staff noise deterministically before adding heavier ML classification.
+This is a practical 80/20 solution. It removes the most damaging staff noise while avoiding fragile color or face-based logic.
 
 ---
 
-# Decision 6: Event Schema
+## Decision 6 — Event Schema
 
-## Previous Decision
+### Previous approach
 
-Use a flattened event schema only.
+Use a flattened internal event schema.
 
-## Issue
+### Issue
 
-The challenge expected metadata fields such as:
+The challenge requires metadata such as:
 
 ```text
 queue_depth
@@ -374,91 +211,86 @@ sku_zone
 session_seq
 ```
 
-A purely flattened schema created scoring risk.
+The uploaded sample events also use non-canonical field names.
 
-## Recommended Decision
+### Decision
 
-Use:
+Use canonical internal:
 
 ```text
 Event Schema v1.2
 ```
 
-with both flattened fields and nested metadata.
+with nested metadata, plus an event normalization adapter.
 
-## Implemented Fields
+### Rationale
 
-```text
-event_id
-store_id
-camera_id
-visitor_id
-timestamp
-event_type
-zone_id
-dwell_ms
-is_staff
-confidence
-metadata.queue_depth
-metadata.sku_zone
-metadata.session_seq
-```
+This preserves a clean internal schema while accepting multiple external payload styles.
 
-## Rationale
+### Trade-off
 
-This preserves backward compatibility while improving challenge compliance.
+The API ingestion layer is slightly more complex.
 
-## Implementation Impact
+### Interview defense
 
-Affected files:
-
-```text
-api/models.py
-cv_pipeline/tracker_state.py
-api/database.py
-api/main.py
-```
-
-## Score Impact
-
-Improves schema compliance and enables heatmap, queue, and anomaly analytics.
+Production systems often normalize data from heterogeneous producers before validation. This adapter makes the ingestion path more robust.
 
 ---
 
-# Decision 7: Database
+## Decision 7 — Event Ingestion
 
-## Alternatives Considered
+### Previous approach
 
-### PostgreSQL
+Strictly validate one schema.
 
-Pros:
+### Issue
 
-- Production-grade
-- Better concurrency
-- Stronger querying
-- Better for multi-service deployment
+Uploaded challenge-style events use fields like:
 
-Cons:
+```text
+id_token
+store_code
+event_timestamp
+zone_entered
+queue_completed
+queue_abandoned
+```
 
-- Requires extra Docker service
-- Credentials/configuration
-- More setup risk
+### Decision
 
-### SQLite
+Normalize raw events before Pydantic validation.
 
-Pros:
+### Rationale
 
-- Zero configuration
-- Simple
-- Fast startup
-- Easy reviewer setup
+This allows the API to accept:
 
-Cons:
+```text
+canonical schema
+sample_events.jsonl-style schema
+```
 
-- Limited concurrency
-- Not ideal for production write-heavy workloads
+without changing downstream database or analytics logic.
 
-## Decision
+### Trade-off
+
+If a raw payload is very malformed, it may still fail validation after normalization. This is acceptable because failures are returned through partial-success response logic.
+
+### Interview defense
+
+This is a robust production pattern: normalize at the boundary, validate internally, and keep the core application stable.
+
+---
+
+## Decision 8 — Database
+
+### Alternatives considered
+
+```text
+PostgreSQL
+SQLite
+```
+
+### Decision
 
 Use:
 
@@ -466,184 +298,133 @@ Use:
 SQLite + SQLAlchemy
 ```
 
-## Rationale
+### Rationale
 
-SQLite minimizes acceptance-gate risk. The project is challenge-focused, and SQLite is sufficient for single-reviewer local evaluation.
+SQLite minimizes reviewer setup risk and avoids extra Docker services, credentials, and migrations during challenge evaluation.
 
-## Trade-off
+### Trade-off
 
-SQLite is not the recommended production database for high-throughput multi-camera ingestion.
+SQLite is not ideal for high-throughput multi-camera production workloads.
 
-## Interview Defense
+### Interview defense
 
-I used SQLite for submission reliability. In production I would migrate to PostgreSQL with Alembic migrations.
+SQLite is suitable for local challenge evaluation. Production deployment should migrate to PostgreSQL with Alembic migrations.
 
 ---
 
-# Decision 8: API Framework
+## Decision 9 — POS Parser
 
-## Alternatives Considered
+### Problem
 
-### Flask
+The official POS schema and uploaded POS CSV schema differ.
 
-Pros:
-
-- Simple
-- Familiar
-
-Cons:
-
-- Weaker typing by default
-- Less automatic schema support
-
-### Django REST Framework
-
-Pros:
-
-- Full-featured
-
-Cons:
-
-- Heavy
-- Too much boilerplate for challenge timeline
-
-## Decision
-
-Use:
+Official style:
 
 ```text
-FastAPI
+transaction_id, store_id, timestamp, basket_value_inr
 ```
 
-## Rationale
-
-FastAPI provides:
-
-- Pydantic validation
-- Automatic OpenAPI docs
-- Simple dependency injection
-- Good async support
-- Clean route structure
-
-## Interview Defense
-
-FastAPI was the best fit for a typed event-ingestion API with structured responses and quick development.
-
----
-
-# Decision 9: Event Ingestion
-
-## Previous Approach
-
-Validate the full batch with Pydantic before entering the route handler.
-
-## Issue
-
-One malformed event could cause the entire batch to fail with HTTP 422.
-
-## Decision
-
-Validate events individually inside `/events/ingest`.
-
-## Implemented Behavior
+Uploaded style:
 
 ```text
-valid events are persisted
-duplicates are skipped
-bad events are reported
-response can be partial_success
+order_id, order_date, order_time, store_id, total_amount
 ```
 
-## Rationale
+### Decision
 
-This is more robust for edge devices, where occasional malformed or duplicate events should not block the whole stream.
+Support both POS schemas.
 
-## Trade-off
+### Rationale
 
-OpenAPI schema is slightly less strict because the route accepts raw body data.
+This reduces evaluator-data risk and keeps POS correlation functional across file variants.
 
-## Interview Defense
+### Trade-off
 
-For streaming edge systems, partial success is preferable to dropping the whole batch.
+The parser has more normalization logic.
+
+### Interview defense
+
+POS integrations often vary by vendor/export. Supporting multiple schemas makes ingestion more production-like.
 
 ---
 
-# Decision 10: Queue Analytics
+## Decision 10 — Funnel Logic
 
-## Previous Approach
+### Previous funnel
 
-Use `VisitorSession.billing_exit_time`.
+```text
+Entered Store → Billing Queue → Purchase
+```
 
-## Issue
+### Required funnel
 
-Without full cross-camera Re-ID, billing-camera visitor IDs may not match entrance-camera visitor IDs.
+```text
+Entered Store → Visited Product Zone → Entered Billing Queue → Completed Purchase
+```
 
-## Decision
+### Decision
 
-Compute queue analytics from raw event stream.
+Upgrade funnel to include `Visited Product Zone`.
 
-## Implemented Inputs
+### Rationale
+
+The new funnel better matches the challenge requirement and gives managers more useful shopper-journey visibility.
+
+### Trade-off
+
+The response shape changed, so backward-compatible keys were preserved.
+
+### Interview defense
+
+The implementation improves compliance while maintaining compatibility with earlier tests and dashboard behavior.
+
+---
+
+## Decision 11 — Queue Analytics
+
+### Alternatives considered
+
+```text
+session-only queue logic
+event-stream-derived queue logic
+```
+
+### Decision
+
+Use event-stream-derived queue analytics.
+
+Inputs:
 
 ```text
 BILLING_QUEUE_JOIN
 BILLING_QUEUE_EXIT
+BILLING_QUEUE_ABANDON
 ```
 
-## Computed Metrics
+### Rationale
 
-```text
-entered_billing_queue
-completed_queue_cycles
-current_queue_depth
-avg_queue_wait_ms
-queue_abandonment_count
-queue_abandonment_rate
-```
+Queue behavior is best inferred from billing-camera events. This is more reliable than depending entirely on global identity, which is not implemented.
 
-## Rationale
+### Trade-off
 
-Queue events from the billing camera are more reliable for queue-specific analytics than session state alone.
+Conversion attribution still depends on POS correlation.
 
-## Trade-off
+### Interview defense
 
-Conversion attribution still depends on POS correlation and visitor identity.
-
-## Interview Defense
-
-This is a pragmatic correction: use the most reliable signal for each metric. Entry metrics use sessions; queue metrics use billing queue events.
+This uses the strongest available signal for queue metrics and avoids overclaiming Re-ID capabilities.
 
 ---
 
-# Decision 11: Heatmap Analytics
+## Decision 12 — Heatmap
 
-## Alternatives Considered
+### Alternatives considered
 
-### Pixel-level heatmap
+```text
+pixel heatmap
+zone-level heatmap
+```
 
-Pros:
-
-- More visual
-- More detailed
-
-Cons:
-
-- Requires homography or floor projection
-- More complex
-- Harder to validate
-
-### Zone-level heatmap
-
-Pros:
-
-- Simple
-- Business-readable
-- Directly tied to store layout
-
-Cons:
-
-- Less spatially granular
-
-## Decision
+### Decision
 
 Use:
 
@@ -651,45 +432,30 @@ Use:
 zone-level heatmap
 ```
 
-## Rationale
+### Rationale
 
-Retail managers care about zone performance. Zone-level counts and dwell times are easier to explain than raw pixel heatmaps.
+Retail managers care about zone engagement, not raw pixel density. Zone-level heatmaps are easier to validate and explain.
 
-## Interview Defense
+### Trade-off
 
-The challenge needed actionable store analytics; zone heatmap is sufficient and robust.
+Less spatial detail than a true pixel-level heatmap.
+
+### Interview defense
+
+Zone-level analytics are more actionable for store operations and are appropriate without homography calibration.
 
 ---
 
-# Decision 12: Anomaly Detection
+## Decision 13 — Anomaly Detection
 
-## Alternatives Considered
+### Alternatives considered
 
-### ML anomaly detection
+```text
+ML anomaly detection
+rule-based anomaly detection
+```
 
-Pros:
-
-- More sophisticated
-
-Cons:
-
-- Needs historical data
-- Hard to validate
-- Overkill for small clips
-
-### Rule-based anomaly detection
-
-Pros:
-
-- Explainable
-- Easy to test
-- Fast to implement
-
-Cons:
-
-- Thresholds are manually chosen
-
-## Decision
+### Decision
 
 Use:
 
@@ -697,7 +463,7 @@ Use:
 rule-based anomaly detection
 ```
 
-## Implemented Rules
+Implemented rules:
 
 ```text
 BILLING_QUEUE_SPIKE
@@ -706,63 +472,69 @@ DEAD_ZONE
 STALE_FEED
 ```
 
-## Rationale
+### Rationale
 
-Rule-based anomalies are reliable, explainable, and suitable for challenge evaluation.
+Rule-based anomalies are deterministic, explainable, testable, and suitable for limited challenge data.
 
-## Trade-off
+### Trade-off
 
-Thresholds are not learned from real long-term history.
+Thresholds are manually chosen rather than learned from long-term historical data.
 
-## Interview Defense
+### Interview defense
 
-In production, rule-based alerts are often the first version. They are transparent and actionable.
+Most production alerting starts with explainable threshold rules before moving to learned anomaly models.
 
 ---
 
-# Decision 13: Dashboard
+## Decision 14 — API Framework
 
-## Alternatives Considered
+### Alternatives considered
 
-### React/Vue frontend
+```text
+Flask
+Django REST Framework
+FastAPI
+```
 
-Pros:
+### Decision
 
-- Professional frontend
-- Flexible UI
+Use:
 
-Cons:
+```text
+FastAPI
+```
 
-- Much slower to build
-- More boilerplate
-- More deployment complexity
+### Rationale
 
-### Terminal dashboard
+FastAPI provides:
 
-Pros:
+* Pydantic validation
+* automatic OpenAPI docs
+* clean route structure
+* good test support
+* strong typing
 
-- Lightweight
-- Fast
+### Trade-off
 
-Cons:
+None significant for this challenge.
 
-- Less accessible for non-technical reviewers
+### Interview defense
 
-### Streamlit
+FastAPI is the best fit for a typed event-ingestion API with structured payloads and fast implementation.
 
-Pros:
+---
 
-- Fast development
-- Data-native
-- Easy charts
-- Simple Docker container
+## Decision 15 — Dashboard
 
-Cons:
+### Alternatives considered
 
-- Polling refresh can flicker
-- Less customizable than React
+```text
+React/Vue
+terminal dashboard
+Streamlit
+```
 
-## Decision
+### Decision
 
 Use:
 
@@ -770,40 +542,42 @@ Use:
 Streamlit
 ```
 
-## Rationale
+### Rationale
 
-Streamlit gave the fastest route to a reviewer-friendly dashboard.
+Streamlit gives a fast, data-oriented dashboard with minimal frontend overhead.
 
-## Implemented Panels
+### Trade-off
 
-```text
-System Health
-North Star KPIs
-Queue KPIs
-Funnel
-Queue Insights
-Heatmap
-Anomalies
-Dwell Summary
-```
+Polling refresh can cause UI flicker.
 
-## Interview Defense
+### Interview defense
 
-The dashboard proves API connectivity and business value without adding frontend complexity.
+The dashboard demonstrates business value quickly and keeps frontend complexity low.
 
 ---
 
-# Decision 14: Containerization
+## Decision 16 — Containerization
 
-## Previous Ideal
+### Ideal
 
-Containerize API, dashboard, and CV worker.
+Containerize:
 
-## Issue
+```text
+API
+Dashboard
+CV worker
+```
 
-Containerizing PyTorch/OpenCV/Ultralytics can create heavy images and GPU/driver issues, especially on Windows and macOS.
+### Issue
 
-## Decision
+Containerizing CV introduces risk from:
+
+* PyTorch image size
+* OpenCV system dependencies
+* CPU/GPU differences
+* reviewer-machine compatibility
+
+### Decision
 
 Containerize:
 
@@ -815,59 +589,46 @@ Dashboard
 Run locally:
 
 ```text
-CV pipeline
+CV worker
 ```
 
-## Rationale
+### Rationale
 
-This protects the acceptance gate. The reviewer can always start the API and dashboard with Docker Compose.
+This protects API/dashboard startup reliability.
 
-## Trade-off
+### Trade-off
 
-The full system is not a single-command Docker deployment.
+The entire pipeline is not single-command Docker.
 
-## Interview Defense
+### Interview defense
 
-This mirrors real edge-cloud architecture: the edge node processes video locally and streams JSON events to the cloud API.
+This mirrors real edge-cloud architecture: video processing runs on an edge node and streams JSON events to a cloud API.
 
 ---
 
-# Decision 15: Structured Logging
+## Decision 17 — Structured Logging
 
-## Alternatives Considered
+### Alternatives considered
 
-### structlog / python-json-logger
+```text
+structlog
+python-json-logger
+standard logging + json.dumps
+```
 
-Pros:
-
-- Better structured logging support
-
-Cons:
-
-- Extra dependency
-- More setup
-
-### Standard logging + json.dumps
-
-Pros:
-
-- No new dependency
-- Easy to implement
-- Good enough for challenge
-
-Cons:
-
-- Less feature-rich
-
-## Decision
+### Decision
 
 Use:
 
 ```text
-standard logging + JSON-style log payloads
+standard logging + JSON-style payloads
 ```
 
-## Logged Fields
+### Rationale
+
+This adds useful observability without adding dependencies.
+
+### Logged fields
 
 ```text
 trace_id
@@ -877,80 +638,72 @@ status_code
 latency_ms
 store_id
 client_host
-```
-
-Ingest-specific fields:
-
-```text
 received_count
 processed_count
 duplicate_count
 error_count
 ```
 
-## Interview Defense
+### Interview defense
 
-This adds practical observability without adding dependency risk.
+The implementation captures the essential production debugging fields with minimal complexity.
 
 ---
 
-# Decision 16: Testing Strategy
+## Decision 18 — Testing Strategy
 
-## Previous State
+### Previous state
 
-No automated tests.
+Minimal tests only.
 
-## Issue
+### Decision
 
-This weakened production readiness and reviewer confidence.
+Expand deterministic API and business-logic tests.
 
-## Decision
-
-Add minimal API regression tests.
-
-## Implemented Tests
+### Implemented test areas
 
 ```text
 health
-valid ingest
-duplicate ingest
-partial-success ingest
-metrics empty state
-funnel empty state
-heatmap empty state
-anomalies empty state
+ingestion
+idempotency
+partial success
+sample-event normalization
+acceptance-gate store
+POS schemas
+funnel stages
+heatmap
+anomaly rules
+staff filtering
 ```
 
-## Result
+### Rationale
 
-```text
-8 passed
-```
+API and business logic are deterministic and suitable for automated testing. CV model output is hardware/model dependent and is validated manually.
 
-## Rationale
+### Trade-off
 
-Testing deterministic API and business logic provides the highest return. CV tests are deferred because video processing is hardware/model dependent.
+No automated YOLO/ByteTrack regression tests yet.
 
-## Interview Defense
+### Interview defense
 
-I prioritized tests around stable business logic and acceptance-gate behavior rather than non-deterministic model inference.
+The test suite focuses on stable acceptance-gate and scoring-critical behavior first.
 
 ---
 
-# Final Baseline
+## Final Baseline
 
 ```text
 Detection Model: YOLOv8n
 Tracking Model: ByteTrack
 Re-ID Strategy: Planned, not implemented
 Zone Detection: Polygon + bottom-center point
-Queue Detection: Event-derived from queue join/exit
+Queue Detection: Event-derived queue cycles
 Staff Detection: Behind-counter heuristic
-Event Schema: v1.2
+Event Schema: v1.2 with normalization adapter
 Database: SQLite + SQLAlchemy
 API Framework: FastAPI
 Dashboard: Streamlit
 Logging: Standard logging with JSON-style records
-Testing: Minimal pytest API regression suite
+Testing: Expanded pytest API/business-logic suite
 Deployment: Docker Compose for API/dashboard, host-side CV
 ```

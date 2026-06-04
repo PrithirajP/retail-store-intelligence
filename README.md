@@ -910,7 +910,106 @@ The CV model output itself is not fully unit-tested because YOLO/ByteTrack behav
 
 ---
 
-## 19. Structured Logging
+## 19. Event Log JSONL Deliverable
+
+The repository includes the required challenge event log file:
+
+```text
+event_log.jsonl
+```
+
+This file is generated after running the CV pipeline and exporting the events accepted by the API. It follows JSONL format, where each line is one valid JSON object and there is no surrounding list.
+
+The event log contains structured events such as:
+
+```text
+ENTRY
+EXIT
+REENTRY
+ZONE_ENTER
+ZONE_EXIT
+ZONE_DWELL
+BILLING_QUEUE_JOIN
+BILLING_QUEUE_EXIT
+BILLING_QUEUE_ABANDON
+```
+
+Each event contains:
+
+```text
+event_id
+store_id
+camera_id
+visitor_id
+event_type
+timestamp
+zone_id
+dwell_ms
+is_staff
+confidence
+metadata
+```
+
+The `metadata` object contains:
+
+```text
+queue_depth
+sku_zone
+session_seq
+```
+
+### Generate the event log
+
+After starting the API and running the CV pipeline, copy the Docker API database to the host:
+
+```powershell
+docker cp store-api:/app/store_intelligence.db .\store_intelligence_from_docker.db
+```
+
+Then run:
+
+```powershell
+python export_event_log.py
+```
+
+This generates:
+
+```text
+event_log.jsonl
+```
+
+### Validate the event log
+
+Run:
+
+```powershell
+python validate_event_log.py
+```
+
+Expected output:
+
+```text
+Valid JSONL file. Total events: <number greater than 0>
+```
+
+The submitted `event_log.jsonl` must be non-empty.
+
+### Repository rule
+
+The required `event_log.jsonl` file is included in the repository because the organizer identified it as a mandatory deliverable and no separate upload field was provided.
+
+The following generated or challenge data files are still excluded from GitHub:
+
+```text
+CCTV videos
+POS CSV files
+SQLite database files
+model weights
+layout images
+```
+
+
+## 20. Structured Logging
 
 Every API request logs JSON-style structured fields:
 
@@ -942,7 +1041,7 @@ X-Trace-Id
 
 ---
 
-## 20. AI-Assisted Engineering
+## 21. AI-Assisted Engineering
 
 AI assistance was used for:
 
@@ -968,7 +1067,7 @@ full appearance-based cross-camera Re-ID deferred
 
 ---
 
-## 21. Known Limitations
+## 22. Known Limitations
 
 1. Full appearance-based cross-camera Re-ID is not implemented. The system now includes lightweight distance-based REENTRY matching at configured entrance cameras, but it does not compare person appearance embeddings across all cameras.
 
@@ -988,7 +1087,7 @@ full appearance-based cross-camera Re-ID deferred
 
 ---
 
-## 22. Production Improvements
+## 23. Production Improvements
 
 Recommended next steps for production:
 
@@ -1008,7 +1107,7 @@ CV model regression tests
 
 ---
 
-## 23. Final Submission Status
+## 24. Final Submission Status
 
 Current status:
 

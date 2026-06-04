@@ -442,7 +442,73 @@ This keeps the internal schema stable while making the API tolerant to provided 
 
 ---
 
-## 13. API Design
+## 13. Event Log Export Design
+
+The challenge requires a JSONL event log following the provided sample-event format. The system generates this file from the persisted API event database after the CV pipeline has processed CCTV clips and posted events to the ingestion API.
+
+Event generation flow:
+
+```text
+CCTV video
+→ YOLOv8n person detection
+→ ByteTrack local tracking
+→ directional line crossing / zone / queue / re-entry logic
+→ normalized Event Schema v1.2
+→ FastAPI ingestion
+→ SQLite events table
+→ event_log.jsonl export
+```
+
+The event log is exported from the API database rather than written directly from the CV process.
+
+This design was chosen because:
+
+1. It guarantees that the submitted event log contains events that were accepted by the ingestion API.
+2. It ensures that the event log follows the same normalized schema used by analytics endpoints.
+3. It keeps `/metrics`, `/funnel`, `/heatmap`, `/anomalies`, and `event_log.jsonl` consistent.
+4. It proves that the full pipeline worked from CV event generation to API persistence.
+
+The exported JSONL file contains one JSON object per line.
+
+Core exported fields:
+
+```text
+event_id
+store_id
+camera_id
+visitor_id
+event_type
+timestamp
+zone_id
+dwell_ms
+is_staff
+confidence
+metadata
+```
+
+The metadata object contains:
+
+```text
+queue_depth
+sku_zone
+session_seq
+```
+
+The validation script checks:
+
+```text
+valid JSON per line
+no blank lines
+required fields are present
+event_type values are valid
+metadata is an object
+event count is greater than zero
+```
+
+The final repository includes `event_log.jsonl` as a required challenge deliverable. Database files, videos, POS CSVs, model weights, and layout images are still excluded from GitHub.
+
+
+## 14. API Design
 
 Framework:
 
@@ -561,7 +627,7 @@ If database access fails, the API returns a structured degraded response and avo
 
 ---
 
-## 14. Database Design
+## 15. Database Design
 
 Database:
 
@@ -636,7 +702,7 @@ SQLite is acceptable for challenge evaluation but should be replaced by PostgreS
 
 ---
 
-## 15. POS Seeding
+## 16. POS Seeding
 
 The POS seeder supports both:
 
@@ -665,7 +731,7 @@ The parser skips malformed rows, deduplicates transaction IDs, and returns a see
 
 ---
 
-## 16. POS Correlation
+## 17. POS Correlation
 
 When a visitor exits billing, the API attempts to correlate that event with POS transactions.
 
@@ -688,7 +754,7 @@ Without full appearance-based cross-camera Re-ID, conversion attribution is stro
 
 ---
 
-## 17. Funnel Logic
+## 18. Funnel Logic
 
 The funnel follows:
 
@@ -720,7 +786,7 @@ BILLING_QUEUE_ABANDON
 
 ---
 
-## 18. Heatmap Logic
+## 19. Heatmap Logic
 
 Heatmap is zone-level, not pixel-level.
 
@@ -755,7 +821,7 @@ BEHIND_COUNTER
 
 ---
 
-## 19. Anomaly Detection
+## 20. Anomaly Detection
 
 Implemented anomaly detection is rule-based.
 
@@ -780,7 +846,7 @@ This design is explainable, deterministic, and suitable for challenge evaluation
 
 ---
 
-## 20. Dashboard Design
+## 21. Dashboard Design
 
 Framework:
 
@@ -816,7 +882,7 @@ This supports the current store mapping, acceptance-gate store, and sample-event
 
 ---
 
-## 21. Structured Logging
+## 22. Structured Logging
 
 Implemented in:
 
@@ -854,7 +920,7 @@ X-Trace-Id
 
 ---
 
-## 22. Testing Strategy
+## 23. Testing Strategy
 
 Implemented test strategy:
 
@@ -887,7 +953,7 @@ CV model output is not fully automated because YOLO/ByteTrack behavior depends o
 
 ---
 
-## 23. AI-Assisted Decisions
+## 24. AI-Assisted Decisions
 
 AI assistance was used as an engineering review and implementation-planning tool, not as an uncontrolled code generator.
 
@@ -955,7 +1021,7 @@ Reason rejected for now:
 
 ---
 
-## 24. Implemented vs Planned
+## 25. Implemented vs Planned
 
 ### Implemented
 
@@ -1002,7 +1068,7 @@ CV model regression tests
 
 ---
 
-## 25. Known Limitations
+## 26. Known Limitations
 
 1. The system includes lightweight REENTRY matching, but full appearance-based cross-camera Re-ID is not implemented.
 2. Directional entry/exit detection depends on correctly calibrated entrance lines.
@@ -1015,7 +1081,7 @@ CV model regression tests
 
 ---
 
-## 26. Final Design Summary
+## 27. Final Design Summary
 
 The implemented system is a pragmatic challenge-ready retail intelligence platform.
 

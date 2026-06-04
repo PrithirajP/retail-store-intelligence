@@ -1,696 +1,251 @@
 # CHOICES.md
 
-# Engineering Choices and Trade-offs
+# Engineering Choices and Rationale
 
 This document records the major engineering decisions made during the Retail Store Intelligence Platform implementation.
 
-The project was implemented under challenge-style constraints, so decisions prioritize:
+The project was implemented under challenge-style constraints, so the choices prioritize:
 
 * acceptance-gate reliability
-* reviewer confidence
+* reviewer-friendly setup
 * implementation simplicity
-* production-oriented reasoning
 * business usefulness
-* honest documentation of limitations
+* testability
+* clear upgrade path for production
 
 ---
 
 ## Decision 1 — Detection Model
 
-### Alternatives considered
-
-```text
-MediaPipe Object Detection
-Faster R-CNN
-YOLOv10 / YOLOv11
-YOLOv8n
-```
-
 ### Decision
 
-Use:
+Use `YOLOv8n` for person detection.
 
-```text
-YOLOv8n
-```
+### Why
 
-### Rationale
-
-YOLOv8n gives a strong balance of speed, simplicity, and adequate person-detection quality for challenge-scale retail analytics.
-
-It integrates easily with Ultralytics tracking.
-
-### Trade-off
-
-The nano model is less accurate than heavier models in:
-
-* occlusion
-* distant shoppers
-* poor lighting
-* crowded frames
-
-### Interview defense
-
-The challenge required a working end-to-end system, not only a high-accuracy detector. YOLOv8n makes the edge pipeline feasible on CPU-class machines and allows more effort to be spent on event processing, API correctness, and analytics.
+YOLOv8n gives a practical balance between speed, simplicity, and person-detection quality. It is lightweight enough for local execution, integrates well with Ultralytics, and supports tracking through ByteTrack. A larger detector may improve accuracy but would increase runtime, dependency size, and reviewer setup risk.
 
 ---
 
 ## Decision 2 — Tracking Model
 
-### Alternatives considered
-
-```text
-SORT
-DeepSORT
-BoT-SORT
-StrongSORT
-ByteTrack
-```
-
 ### Decision
 
-Use:
+Use `ByteTrack` for local camera-level tracking.
 
-```text
-ByteTrack
-```
+### Why
 
-### Rationale
-
-ByteTrack handles low-confidence detections better than SORT and avoids the extra model/dependency overhead of DeepSORT or StrongSORT.
-
-### Trade-off
-
-ByteTrack gives local camera tracking only. It does not solve full global cross-camera identity by itself.
-
-### Interview defense
-
-ByteTrack is a strong local tracker for a time-limited implementation. It gives stable enough IDs for zone and queue analytics while leaving a clean upgrade path to full Re-ID.
+ByteTrack handles low-confidence detections better than simple SORT and avoids the extra appearance-model dependency of DeepSORT or StrongSORT. It is suitable for tracking shoppers within a single camera view and supports zone, queue, and line-crossing logic. Full global cross-camera identity is treated separately through lightweight re-entry handling and documented future Re-ID upgrades.
 
 ---
 
 ## Decision 3 — Re-ID and REENTRY Strategy
 
-### Ideal production approach
+### Decision
 
-```text
-OSNet / TorchReID-style appearance embeddings
-cross-camera identity matching
-global visitor ID assignment
-session stitching
-```
+Implement lightweight distance-based `REENTRY` matching at configured entrance cameras.
 
-### Current implementation
+### Why
 
-The project implements:
+Full appearance-based Re-ID using OSNet or TorchReID would require another deep model, embedding storage, similarity thresholds, and additional validation. For this challenge, a lighter approach is more reliable: when a visitor exits through an entrance line, the tracker stores a recent-exit candidate. If a new local track re-enters near that exit within a configured time and distance window, the system emits `REENTRY` and maps the new local track back to the earlier visitor ID.
 
-```text
-lightweight distance-based REENTRY matching at configured entrance cameras
-```
-
-When a visitor exits through a configured entrance line, the tracker stores a recent-exit candidate. If a new local track crosses inward near that exit within the configured time and distance threshold, the tracker emits:
-
-```text
-REENTRY
-```
-
-and maps the new local track back to the earlier visitor ID.
-
-### Rationale
-
-This provides a practical improvement over pure ByteTrack-local IDs without adding a second deep learning model, embedding storage, or threshold-heavy appearance matching.
-
-### Trade-off
-
-This is not full cross-camera Re-ID. It works best for re-entry through the same configured entrance camera and depends on distance/time thresholds.
-
-### Interview defense
-
-Full Re-ID is valuable but risky to add under challenge constraints because false identity merges can damage visitor counts and conversion logic. The implemented lightweight matcher reduces re-entry double counting while preserving a clean future path to appearance-based Re-ID.
+This reduces re-entry double counting without adding a heavy Re-ID model.
 
 ---
 
 ## Decision 4 — Entry, Exit, and Zone Detection
 
-### Alternatives considered
-
-```text
-entry-door polygon only
-directional line crossing
-homography-based floor projection
-semantic segmentation
-```
-
 ### Decision
 
-Use:
+Use bottom-center foot points, manual zone polygons, and directional entrance-line crossing.
 
-```text
-bottom-center foot point
-+ manual zone polygons
-+ directional entrance-line crossing
-```
+### Why
 
-### Rationale
-
-The bottom-center of the bounding box approximates the person’s floor position. Manual polygons provide simple and explainable zone logic. Directional entrance lines improve entry/exit counting by detecting actual crossing direction.
-
-### Trade-off
-
-Accuracy depends on camera calibration. If the entrance line or polygon is poorly placed, entry/exit counts can still be undercounted or overcounted.
-
-### Interview defense
-
-This is a practical CV architecture for fixed CCTV cameras. It is explainable, fast, testable, and does not require expensive segmentation or homography calibration for the challenge baseline.
+The bottom-center of a bounding box approximates the person’s floor position in CCTV footage. Manual polygons make zone logic simple, explainable, and easy to adjust. Directional entrance-line crossing improves visitor counting compared with entry-door polygon-only logic because the system can distinguish `IN` and `OUT` movement.
 
 ---
 
 ## Decision 5 — Staff Detection
 
-### Alternatives considered
-
-```text
-uniform color masking
-custom staff classifier
-face-based recognition
-behind-counter heuristic
-```
-
 ### Decision
 
-Use:
+Use a behind-counter spatial heuristic for staff exclusion.
 
-```text
-behind-counter spatial heuristic
-```
+### Why
 
-### Rationale
-
-Cashiers are the biggest source of staff noise in queue analytics. The behind-counter heuristic removes that noise with almost no compute cost.
-
-### Trade-off
-
-Roaming floor staff may still be counted as shoppers.
-
-### Interview defense
-
-This is a practical 80/20 solution. It removes the most damaging staff noise while avoiding fragile color or face-based logic.
+Cashiers are the most common source of staff noise in billing and queue analytics. If a person remains inside the `BEHIND_COUNTER` polygon for more than the configured frame threshold, the visitor is marked as staff and excluded from customer metrics. This is simple, fast, and avoids fragile uniform-color or face-recognition assumptions.
 
 ---
 
 ## Decision 6 — Event Schema
 
-### Previous approach
-
-Use a flattened internal event schema.
-
-### Issue
-
-The challenge requires metadata such as:
-
-```text
-queue_depth
-sku_zone
-session_seq
-```
-
-The uploaded sample events also use non-canonical field names.
-
 ### Decision
 
-Use canonical internal:
+Use canonical `Event Schema v1.2` with nested metadata.
 
-```text
-Event Schema v1.2
-```
+### Why
 
-with nested metadata, plus an event normalization adapter.
-
-### Rationale
-
-This preserves a clean internal schema while accepting multiple external payload styles.
-
-### Trade-off
-
-The API ingestion layer is slightly more complex.
-
-### Interview defense
-
-Production systems often normalize data from heterogeneous producers before validation. This adapter makes the ingestion path more robust.
+The challenge requires structured fields such as `event_id`, `store_id`, `camera_id`, `visitor_id`, `event_type`, `timestamp`, `zone_id`, `dwell_ms`, `is_staff`, `confidence`, and `metadata`. The nested metadata object stores queue depth, SKU zone, and session sequence. This keeps the internal event format consistent while supporting analytics and API validation.
 
 ---
 
 ## Decision 7 — Event Ingestion
 
-### Previous approach
-
-Strictly validate one schema.
-
-### Issue
-
-Uploaded challenge-style events use fields like:
-
-```text
-id_token
-store_code
-event_timestamp
-zone_entered
-queue_completed
-queue_abandoned
-```
-
 ### Decision
 
-Normalize raw events before Pydantic validation.
+Normalize incoming raw events before validation.
 
-### Rationale
+### Why
 
-This allows the API to accept:
-
-```text
-canonical schema
-sample_events.jsonl-style schema
-```
-
-without changing downstream database or analytics logic.
-
-### Trade-off
-
-If a raw payload is very malformed, it may still fail validation after normalization. This is acceptable because failures are returned through partial-success response logic.
-
-### Interview defense
-
-This is a robust production pattern: normalize at the boundary, validate internally, and keep the core application stable.
+The provided sample-event format and the internal canonical schema may use different field names. The ingestion layer maps fields such as `id_token`, `track_id`, `store_code`, `event_timestamp`, `zone_entered`, `queue_completed`, and `queue_abandoned` into the internal schema. This allows the API to support both challenge-style sample events and canonical CV-generated events without changing downstream logic.
 
 ---
 
-## Decision 8 — Database
-
-### Alternatives considered
-
-```text
-PostgreSQL
-SQLite
-```
+## Decision 8 — Event Log JSONL Generation
 
 ### Decision
 
-Use:
+Generate `event_log.jsonl` from the API database after events are ingested, validated, normalized, and persisted.
 
-```text
-SQLite + SQLAlchemy
-```
+### Why
 
-### Rationale
-
-SQLite minimizes reviewer setup risk and avoids extra Docker services, credentials, and migrations during challenge evaluation.
-
-### Trade-off
-
-SQLite is not ideal for high-throughput multi-camera production workloads.
-
-### Interview defense
-
-SQLite is suitable for local challenge evaluation. Production deployment should migrate to PostgreSQL with Alembic migrations.
+The event log is a mandatory deliverable. Exporting it from the persisted API database ensures that the submitted JSONL contains only accepted events and stays consistent with `/metrics`, `/funnel`, `/heatmap`, and `/anomalies`. The file is included in the repository because no separate event-log upload field was available, while videos, POS files, model weights, and database files remain excluded.
 
 ---
 
-## Decision 9 — POS Parser
-
-### Problem
-
-The official POS schema and uploaded POS CSV schema differ.
-
-Official style:
-
-```text
-transaction_id, store_id, timestamp, basket_value_inr
-```
-
-Uploaded style:
-
-```text
-order_id, order_date, order_time, store_id, total_amount
-```
+## Decision 9 — Database
 
 ### Decision
 
-Support both POS schemas.
+Use SQLite with SQLAlchemy.
 
-### Rationale
+### Why
 
-This reduces evaluator-data risk and keeps POS correlation functional across file variants.
-
-### Trade-off
-
-The parser has more normalization logic.
-
-### Interview defense
-
-POS integrations often vary by vendor/export. Supporting multiple schemas makes ingestion more production-like.
+SQLite minimizes setup friction for reviewers and avoids requiring a separate database service, credentials, or migrations. SQLAlchemy keeps the database layer structured and allows a future migration to PostgreSQL if the system is productionized.
 
 ---
 
-## Decision 10 — Funnel Logic
+## Decision 10 — POS Parser
 
-### Previous funnel
+### Decision
 
-```text
-Entered Store → Billing Queue → Purchase
-```
+Support both official-style and uploaded/current POS CSV schemas.
 
-### Required funnel
+### Why
+
+The POS format may vary between challenge resources and exported files. The parser supports schemas such as `transaction_id, store_id, timestamp, basket_value_inr` and `order_id, order_date, order_time, store_id, total_amount`. This reduces evaluator-data risk and keeps conversion correlation functional across file variants.
+
+---
+
+## Decision 11 — Funnel Logic
+
+### Decision
+
+Use a four-stage shopper funnel:
 
 ```text
 Entered Store → Visited Product Zone → Entered Billing Queue → Completed Purchase
 ```
 
-### Decision
+### Why
 
-Upgrade funnel to include `Visited Product Zone`.
-
-### Rationale
-
-The new funnel better matches the challenge requirement and gives managers more useful shopper-journey visibility.
-
-### Trade-off
-
-The response shape changed, so backward-compatible keys were preserved.
-
-### Interview defense
-
-The implementation improves compliance while maintaining compatibility with earlier tests and dashboard behavior.
+This funnel better represents the retail customer journey than a simple entry-to-purchase pipeline. It separates browsing behavior from queue participation and purchase completion, giving more useful business insight into where shoppers drop off.
 
 ---
 
-## Decision 11 — Queue Analytics
-
-### Alternatives considered
-
-```text
-session-only queue logic
-event-stream-derived queue logic
-```
+## Decision 12 — Queue Analytics
 
 ### Decision
 
-Use event-stream-derived queue analytics.
+Compute queue metrics from event-stream queue cycles.
 
-Inputs:
+### Why
 
-```text
-BILLING_QUEUE_JOIN
-BILLING_QUEUE_EXIT
-BILLING_QUEUE_ABANDON
-```
-
-### Rationale
-
-Queue behavior is best inferred from billing-camera events. This is more reliable than depending entirely on global identity, which is not fully appearance-based yet.
-
-### Trade-off
-
-Conversion attribution still depends on POS correlation.
-
-### Interview defense
-
-This uses the strongest available signal for queue metrics and avoids overclaiming full Re-ID capabilities.
+Billing queue behavior is best inferred from queue-specific events: `BILLING_QUEUE_JOIN`, `BILLING_QUEUE_EXIT`, and `BILLING_QUEUE_ABANDON`. This is more reliable than depending only on global session state, especially because full appearance-based cross-camera Re-ID is not implemented.
 
 ---
 
-## Decision 12 — Heatmap
-
-### Alternatives considered
-
-```text
-pixel heatmap
-zone-level heatmap
-```
+## Decision 13 — Heatmap
 
 ### Decision
 
-Use:
+Use zone-level heatmap analytics instead of pixel-level heatmaps.
 
-```text
-zone-level heatmap
-```
+### Why
 
-### Rationale
-
-Retail managers care about zone engagement, not raw pixel density. Zone-level heatmaps are easier to validate and explain.
-
-### Trade-off
-
-Less spatial detail than a true pixel-level heatmap.
-
-### Interview defense
-
-Zone-level analytics are more actionable for store operations and are appropriate without homography calibration.
+Retail managers usually need to know which product zones receive attention, not exact pixel-density maps. Zone-level heatmaps are easier to validate, explain, and connect to business actions. They also avoid requiring homography calibration from CCTV pixels to floor-plan coordinates.
 
 ---
 
-## Decision 13 — Anomaly Detection
-
-### Alternatives considered
-
-```text
-ML anomaly detection
-rule-based anomaly detection
-```
+## Decision 14 — Anomaly Detection
 
 ### Decision
 
-Use:
+Use rule-based anomaly detection.
 
-```text
-rule-based anomaly detection
-```
+### Why
 
-Implemented rules:
-
-```text
-BILLING_QUEUE_SPIKE
-CONVERSION_DROP
-DEAD_ZONE
-STALE_FEED
-```
-
-### Rationale
-
-Rule-based anomalies are deterministic, explainable, testable, and suitable for limited challenge data.
-
-### Trade-off
-
-Thresholds are manually chosen rather than learned from long-term historical data.
-
-### Interview defense
-
-Most production alerting starts with explainable threshold rules before moving to learned anomaly models.
+The challenge data is limited, so learned anomaly models would be difficult to train and validate reliably. Rule-based anomalies such as `BILLING_QUEUE_SPIKE`, `CONVERSION_DROP`, `DEAD_ZONE`, and `STALE_FEED` are deterministic, explainable, and easy to test.
 
 ---
 
-## Decision 14 — API Framework
-
-### Alternatives considered
-
-```text
-Flask
-Django REST Framework
-FastAPI
-```
+## Decision 15 — API Framework
 
 ### Decision
 
-Use:
+Use FastAPI.
 
-```text
-FastAPI
-```
+### Why
 
-### Rationale
-
-FastAPI provides:
-
-* Pydantic validation
-* automatic OpenAPI docs
-* clean route structure
-* good test support
-* strong typing
-
-### Trade-off
-
-None significant for this challenge.
-
-### Interview defense
-
-FastAPI is the best fit for a typed event-ingestion API with structured payloads and fast implementation.
+FastAPI provides strong request validation, clean endpoint design, automatic OpenAPI documentation, and good testing support through `TestClient`. It fits well for a structured event-ingestion and analytics API.
 
 ---
 
-## Decision 15 — Dashboard
-
-### Alternatives considered
-
-```text
-React/Vue
-terminal dashboard
-Streamlit
-```
+## Decision 16 — Dashboard
 
 ### Decision
 
-Use:
+Use Streamlit for the dashboard.
 
-```text
-Streamlit
-```
+### Why
 
-### Rationale
-
-Streamlit gives a fast, data-oriented dashboard with minimal frontend overhead.
-
-### Trade-off
-
-Polling refresh can cause UI flicker.
-
-### Interview defense
-
-The dashboard demonstrates business value quickly and keeps frontend complexity low.
+Streamlit allows rapid development of a business-facing analytics dashboard with minimal frontend complexity. It supports KPI cards, tables, charts, store selection, refresh controls, and API-driven panels for metrics, funnel, heatmap, anomalies, and health.
 
 ---
 
-## Decision 16 — Containerization
-
-### Default deployment
-
-The default Docker Compose path runs:
-
-```text
-store-api
-store-dashboard
-```
-
-### Optional deployment
-
-The CV pipeline can also run through:
-
-```text
-docker compose --profile cv up --build
-```
-
-This starts an optional:
-
-```text
-cv-worker
-```
-
-service that runs `orchestrator.py`, mounts local challenge data, waits for the API health check, and posts events to the internal API service URL.
-
-### Rationale
-
-API and dashboard must be reliable for reviewer startup. The CV stack is heavier because it depends on PyTorch, OpenCV, Ultralytics, and tracking libraries. Making CV an optional profile gives reviewers two paths:
-
-```text
-lightweight default path: API + dashboard
-full optional path: API + dashboard + CV worker
-```
-
-### Trade-off
-
-The optional CV Docker profile may require more Docker disk, memory, and build time than the default services.
-
-### Interview defense
-
-This mirrors an edge-cloud system. The backend and dashboard run as services, while CV can run either locally as an edge process or inside a dedicated container profile.
-
----
-
-## Decision 17 — Structured Logging
-
-### Alternatives considered
-
-```text
-structlog
-python-json-logger
-standard logging + json.dumps
-```
+## Decision 17 — Containerization
 
 ### Decision
 
-Use:
+Use Docker Compose for API and dashboard by default, with an optional `cv-worker` profile for the CV pipeline.
 
-```text
-standard logging + JSON-style payloads
-```
+### Why
 
-### Rationale
-
-This adds useful observability without adding dependencies.
-
-### Logged fields
-
-```text
-trace_id
-method
-endpoint
-status_code
-latency_ms
-store_id
-client_host
-received_count
-processed_count
-duplicate_count
-error_count
-```
-
-### Interview defense
-
-The implementation captures the essential production debugging fields with minimal complexity.
+The API and dashboard must run reliably for reviewers using `docker compose up --build`. The CV stack is heavier because it depends on PyTorch, OpenCV, Ultralytics, and tracking libraries. Making CV optional gives two paths: a lightweight default path for API/dashboard and a full CV path using `docker compose --profile cv up --build`.
 
 ---
 
-## Decision 18 — Testing Strategy
-
-### Previous state
-
-Minimal tests only.
+## Decision 18 — Structured Logging
 
 ### Decision
 
-Expand deterministic API, business-logic, dashboard-contract, and tracker-state tests.
+Use standard Python logging with JSON-style structured payloads.
 
-### Implemented test areas
+### Why
 
-```text
-health
-database failure degradation
-ingestion
-idempotency
-partial success
-sample-event normalization
-acceptance-gate store
-POS schemas
-funnel stages
-heatmap
-anomaly rules
-staff filtering
-dashboard contract
-directional line crossing
-lightweight REENTRY matching
-CV Docker profile contract
-```
+This provides important observability fields without adding extra logging dependencies. The API logs trace ID, method, endpoint, status code, latency, store ID, client host, and ingestion counters. Each response also includes an `X-Trace-Id`.
 
-### Rationale
+---
 
-API, business logic, and tracker-state rules are deterministic and suitable for automated testing. Raw YOLO/ByteTrack model output is hardware/model dependent and is validated manually.
+## Decision 19 — Testing Strategy
 
-### Trade-off
+### Decision
 
-No full automated CV model regression suite yet.
+Use pytest with deterministic API, business-logic, dashboard-contract, and tracker-state tests.
 
-### Interview defense
+### Why
 
-The test suite focuses on stable acceptance-gate and scoring-critical behavior first, while leaving video/model regression testing as a production improvement.
+API behavior, event validation, metrics, funnel logic, heatmap logic, anomaly rules, staff filtering, line crossing, and re-entry matching are deterministic and suitable for automated tests. Raw YOLO/ByteTrack model output is hardware- and video-dependent, so it is validated through runtime CV pipeline execution rather than unit tests.
 
 ---
 
@@ -711,4 +266,5 @@ Dashboard: Streamlit
 Logging: Standard logging with JSON-style records
 Testing: Expanded pytest API/business/dashboard/tracker suite
 Deployment: Docker Compose for API/dashboard, optional cv-worker profile, host-side CV supported
+Event Log: event_log.jsonl generated from accepted API events and included as required deliverable
 ```

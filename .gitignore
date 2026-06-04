@@ -9,6 +9,7 @@ data/*
 *.mkv
 *.csv
 *.jsonl
+!event_log.jsonl
 *.png
 *.jpg
 *.jpeg

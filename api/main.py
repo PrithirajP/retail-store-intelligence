@@ -917,6 +917,14 @@ def _compute_current_queue_depth(db: Session, store_id: str) -> int:
 
 
 def _compute_avg_dwell_by_zone(db: Session, store_id: str) -> dict:
+    """
+    Computes average dwell time for customer-facing product zones only.
+
+    Non-product operational zones such as ENTRY_DOOR, BILLING_QUEUE, and
+    BEHIND_COUNTER are excluded so the metrics endpoint remains aligned with
+    the heatmap/product-zone interpretation.
+    """
+
     rows = (
         db.query(
             EventRecord.zone_id,
@@ -937,6 +945,10 @@ def _compute_avg_dwell_by_zone(db: Session, store_id: str) -> dict:
 
     for row in rows:
         zone_key = row.zone_id or row.sku_zone or "UNKNOWN"
+
+        if zone_key in EXCLUDED_HEATMAP_ZONES:
+            continue
+
         result[zone_key] = round(float(row.avg_dwell_ms or 0.0), 2)
 
     return result
@@ -1107,6 +1119,42 @@ def _compute_queue_summary(db: Session, store_id: str) -> dict:
         "queue_data_source": "event_stream",
     }
 
+def _compute_queue_abandonment_metrics(
+    queue_summary: dict,
+    converted_visitors: int,
+) -> dict:
+    """
+    Computes queue abandonment using closed queue cycles.
+
+    A queue cycle is considered abandoned if:
+    1. The event stream explicitly contains BILLING_QUEUE_ABANDON, or
+    2. A visitor completed a queue cycle but was not correlated with a POS conversion.
+
+    This mirrors the funnel endpoint logic and exposes the same business signal
+    through /metrics.
+    """
+
+    completed_queue_cycles = queue_summary["completed_queue_cycles"]
+    abandoned_queue_cycles = queue_summary["abandoned_queue_cycles"]
+
+    queue_abandonment_count = max(
+        abandoned_queue_cycles,
+        completed_queue_cycles - converted_visitors,
+        0,
+    )
+
+    closed_queue_cycles = completed_queue_cycles + abandoned_queue_cycles
+
+    queue_abandonment_rate = (
+        round(queue_abandonment_count / closed_queue_cycles * 100, 2)
+        if closed_queue_cycles > 0
+        else 0.0
+    )
+
+    return {
+        "queue_abandonment_count": queue_abandonment_count,
+        "queue_abandonment_rate": queue_abandonment_rate,
+    }
 
 # ---------------------------------------------------------------------
 # Heatmap helpers
@@ -1427,6 +1475,10 @@ def _detect_stale_feed(db: Session, store_id: str) -> Optional[dict]:
 async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
     stats = _get_conversion_stats(db, store_id)
     queue_summary = _compute_queue_summary(db, store_id)
+    queue_abandonment = _compute_queue_abandonment_metrics(
+        queue_summary=queue_summary,
+        converted_visitors=stats["converted_visitors"],
+    )
 
     avg_dwell_ms_by_zone = _compute_avg_dwell_by_zone(db, store_id)
     total_events = _get_total_event_count(db, store_id)
@@ -1439,11 +1491,14 @@ async def get_store_metrics(store_id: str, db: Session = Depends(get_db)):
         "conversion_rate_percentage": stats["conversion_rate_percentage"],
         "current_queue_depth": queue_summary["current_queue_depth"],
         "avg_queue_wait_ms": queue_summary["avg_queue_wait_ms"],
+        "queue_abandonment_count": queue_abandonment["queue_abandonment_count"],
+        "queue_abandonment_rate": queue_abandonment["queue_abandonment_rate"],
+        "completed_queue_cycles": queue_summary["completed_queue_cycles"],
+        "abandoned_queue_cycles": queue_summary["abandoned_queue_cycles"],
         "avg_dwell_ms_by_zone": avg_dwell_ms_by_zone,
         "total_events": total_events,
         "last_event_timestamp": last_event_timestamp,
     }
-
 
 @app.get("/stores/{store_id}/heatmap", tags=["Analytics"])
 async def get_store_heatmap(store_id: str, db: Session = Depends(get_db)):
@@ -1502,19 +1557,13 @@ async def get_store_funnel(store_id: str, db: Session = Depends(get_db)):
     completed_queue_cycles = queue_summary["completed_queue_cycles"]
     abandoned_queue_cycles = queue_summary["abandoned_queue_cycles"]
 
-    queue_abandonment_count = max(
-        abandoned_queue_cycles,
-        completed_queue_cycles - converted,
-        0,
+    queue_abandonment = _compute_queue_abandonment_metrics(
+        queue_summary=queue_summary,
+        converted_visitors=converted,
     )
 
-    closed_queue_cycles = completed_queue_cycles + abandoned_queue_cycles
-
-    queue_abandonment_rate = (
-        round(queue_abandonment_count / closed_queue_cycles * 100, 2)
-        if closed_queue_cycles > 0
-        else 0.0
-    )
+    queue_abandonment_count = queue_abandonment["queue_abandonment_count"]
+    queue_abandonment_rate = queue_abandonment["queue_abandonment_rate"]
 
     return {
         "store_id": store_id,

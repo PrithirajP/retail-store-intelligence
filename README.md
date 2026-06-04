@@ -1,6 +1,6 @@
 # Retail Store Intelligence Platform
 
-A computer-vision-powered retail analytics system that converts CCTV-style store activity and POS transaction data into structured store intelligence.
+A computer-vision-powered retail analytics system that converts CCTV-style store activity and POS transaction data into structured retail intelligence.
 
 The system detects shopper activity, maps movement into store zones, emits structured events, ingests them through a FastAPI backend, stores them in SQLite, correlates billing activity with POS transactions, and displays business metrics through a Streamlit dashboard.
 
@@ -18,7 +18,7 @@ The platform estimates and exposes:
 * queue abandonment
 * current queue depth
 * average queue wait time
-* average dwell time by zone
+* average dwell time by product zone
 * zone-level heatmap scores
 * operational anomalies
 * API health and stale-feed status
@@ -98,11 +98,23 @@ retail-store-intelligence/
 │   └── test_staff_filtering.py
 │
 ├── data/
+│   ├── README.md
+│   ├── .gitkeep
 │   ├── Brigade_Bangalore_10_April_26.csv
-│   ├── CAM_01.mp4
-│   ├── CAM_02.mp4
-│   ├── CAM_03.mp4
-│   └── CAM_05.mp4
+│   │
+│   ├── ST1008/
+│   │   ├── Store_1_layout.png
+│   │   ├── CAM_1_ZONE.mp4
+│   │   ├── CAM_2_ZONE.mp4
+│   │   ├── CAM_3_ENTRY.mp4
+│   │   └── CAM_5_BILLING.mp4
+│   │
+│   └── STORE_2/
+│       ├── Store_2_layout.png
+│       ├── ENTRY_1.mp4
+│       ├── ENTRY_2.mp4
+│       ├── BILLING_AREA.mp4
+│       └── ZONE.mp4
 │
 ├── docker-compose.yml
 ├── pytest.ini
@@ -112,29 +124,70 @@ retail-store-intelligence/
 └── SUBMISSION_CHECKLIST.md
 ```
 
+Important:
+
+Challenge datasets, CCTV videos, POS CSV files, layout images, generated databases, and model weights are not committed to GitHub.
+
+Only placeholders such as `data/.gitkeep` and `data/README.md` should be committed.
+
 ---
 
-## 4. Required Data Placement
+## 4. Required Local Data Placement
 
-Create a `data/` folder at the project root.
+Create a `data/` folder at the project root and place the challenge-provided files locally.
 
-Expected files:
-
-```text
-data/Brigade_Bangalore_10_April_26.csv
-data/CAM_01.mp4
-data/CAM_02.mp4
-data/CAM_03.mp4
-data/CAM_05.mp4
-```
-
-The POS CSV is mounted into the API container at:
+Final expected local structure:
 
 ```text
-/app/data/Brigade_Bangalore_10_April_26.csv
+data/
+├── Brigade_Bangalore_10_April_26.csv
+│
+├── ST1008/
+│   ├── Store_1_layout.png
+│   ├── CAM_1_ZONE.mp4
+│   ├── CAM_2_ZONE.mp4
+│   ├── CAM_3_ENTRY.mp4
+│   └── CAM_5_BILLING.mp4
+│
+└── STORE_2/
+    ├── Store_2_layout.png
+    ├── ENTRY_1.mp4
+    ├── ENTRY_2.mp4
+    ├── BILLING_AREA.mp4
+    └── ZONE.mp4
 ```
 
-The CV pipeline expects videos relative to `cv_pipeline/`, so run the CV script from inside that folder.
+Confirmed store mapping:
+
+```text
+Store 1 = ST1008
+Store 2 = STORE_2
+```
+
+Reason:
+
+The POS sample transaction file confirms Store 1 as `ST1008`. Store 2 has no confirmed POS store ID, so it is handled internally as `STORE_2`.
+
+Important POS rule:
+
+```text
+CV event store_id must match POS CSV store_id.
+```
+
+For Store 1:
+
+```text
+CV store_id = ST1008
+POS store_id = ST1008
+```
+
+For Store 2:
+
+```text
+CV store_id = STORE_2
+```
+
+If no POS file exists for `STORE_2`, Store 2 conversion rate will remain `0.0%`. This is expected and documented.
 
 ---
 
@@ -164,6 +217,27 @@ cd cv_pipeline
 python orchestrator.py
 ```
 
+To run only one store:
+
+### Windows PowerShell
+
+```powershell
+$env:ONLY_STORE="STORE_2"
+python orchestrator.py
+```
+
+To clear the single-store setting:
+
+```powershell
+Remove-Item Env:\ONLY_STORE
+```
+
+### macOS / Linux
+
+```bash
+ONLY_STORE=STORE_2 python orchestrator.py
+```
+
 ### Step 3 — Run Tests
 
 From the project root:
@@ -172,11 +246,13 @@ From the project root:
 pytest
 ```
 
-Expected result after all phases:
+Expected result:
 
 ```text
 32 passed
 ```
+
+If dashboard contract tests are added, the expected count may increase.
 
 ---
 
@@ -203,6 +279,15 @@ pip install -r cv_pipeline/requirements.txt
 cd cv_pipeline
 python orchestrator.py
 ```
+
+Optional speed setting:
+
+```powershell
+$env:FRAME_SKIP="5"
+python orchestrator.py
+```
+
+This processes fewer frames and is useful for quicker local validation.
 
 ---
 
@@ -337,6 +422,7 @@ Example:
 
 ```text
 GET /stores/ST1008/metrics
+GET /stores/STORE_2/metrics
 GET /stores/STORE_BLR_002/metrics
 ```
 
@@ -386,6 +472,18 @@ Backward-compatible keys are also preserved:
 ```text
 2_entered_billing_queue
 3_completed_purchase
+```
+
+Queue insight fields include:
+
+```text
+queue_abandonment_count
+queue_abandonment_rate
+avg_queue_wait_ms
+completed_queue_cycles
+abandoned_queue_cycles
+current_queue_depth
+queue_data_source
 ```
 
 ---
@@ -536,16 +634,24 @@ Current CV camera mapping is defined in:
 cv_pipeline/orchestrator.py
 ```
 
-Current video mapping:
+### ST1008
 
 ```text
-CAM_ENTRANCE  → ../data/CAM_03.mp4
-CAM_BILLING   → ../data/CAM_05.mp4
-CAM_MAKEUP    → ../data/CAM_02.mp4
-CAM_SKINCARE  → ../data/CAM_01.mp4
+CAM_1_ZONE      → data/ST1008/CAM_1_ZONE.mp4      → SKINCARE
+CAM_2_ZONE      → data/ST1008/CAM_2_ZONE.mp4      → MAKEUP
+CAM_3_ENTRY     → data/ST1008/CAM_3_ENTRY.mp4     → ENTRY_DOOR
+CAM_5_BILLING   → data/ST1008/CAM_5_BILLING.mp4   → BILLING_QUEUE / BEHIND_COUNTER
 ```
 
-Run from inside `cv_pipeline/` so the relative paths resolve correctly.
+### STORE_2
+
+```text
+ENTRY_1         → data/STORE_2/ENTRY_1.mp4        → ENTRY_DOOR
+BILLING_AREA    → data/STORE_2/BILLING_AREA.mp4   → BILLING_QUEUE / BEHIND_COUNTER
+ZONE            → data/STORE_2/ZONE.mp4           → PRODUCT_ZONE
+```
+
+`STORE_2/ENTRY_2.mp4` is intentionally not used in the final baseline to reduce double-counting. It can be re-enabled only if it is confirmed to cover a different non-overlapping door.
 
 ---
 
@@ -634,7 +740,7 @@ Run:
 pytest
 ```
 
-Expected result after all phases:
+Expected result:
 
 ```text
 32 passed
@@ -728,6 +834,7 @@ full CV Dockerization deferred
 8. Dashboard uses polling, not WebSockets.
 9. Roaming staff may still be counted as customers.
 10. CV processing may be slow on CPU.
+11. Store 2 conversion remains zero unless POS data for `STORE_2` is provided.
 
 ---
 
@@ -779,4 +886,5 @@ Main limitations:
 no full cross-camera Re-ID
 CV worker outside Docker
 manual polygon calibration
+SQLite used for challenge deployment
 ```

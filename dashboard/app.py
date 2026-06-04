@@ -3,488 +3,383 @@ import time
 from typing import Any, Dict, Optional
 
 import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
 import requests
 import streamlit as st
 
 
-API_BASE_URL = os.getenv("API_BASE_URL", "http://store-api:8000")
-DEFAULT_STORE_ID = os.getenv("STORE_ID", "ST1008")
-REFRESH_SECONDS = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "5"))
-
-STORE_OPTIONS = [
-    "ST1008",
-    "STORE_2",
-]
+API_BASE_URL = os.getenv("API_BASE_URL", "http://store-api:8000").rstrip("/")
+DEFAULT_STORE_OPTIONS = os.getenv("STORE_OPTIONS", "ST1008,STORE_2")
 
 
-st.set_page_config(
-    page_title="Store Intelligence Dashboard",
-    page_icon="🛒",
-    layout="wide",
-)
+def _get_store_options() -> list[str]:
+    stores = [
+        item.strip()
+        for item in DEFAULT_STORE_OPTIONS.split(",")
+        if item.strip()
+    ]
+
+    if not stores:
+        return ["ST1008", "STORE_2"]
+
+    return stores
 
 
-def _safe_get(endpoint: str) -> Optional[Dict[str, Any]]:
-    url = f"{API_BASE_URL}{endpoint}"
+def _get_json(path: str, timeout: int = 5) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    url = f"{API_BASE_URL}{path}"
 
     try:
-        response = requests.get(url, timeout=3)
-        response.raise_for_status()
-        return response.json()
+        response = requests.get(url, timeout=timeout)
 
-    except requests.exceptions.RequestException as exc:
-        st.warning(f"Connecting to API... `{exc}`")
-        return None
+        if response.status_code != 200:
+            return None, f"HTTP {response.status_code}: {response.text[:300]}"
 
-    except ValueError:
-        st.warning("API returned an invalid JSON response.")
-        return None
+        return response.json(), None
+
+    except requests.RequestException as exc:
+        return None, str(exc)
 
 
-@st.cache_data(ttl=2)
-def fetch_health() -> Optional[Dict[str, Any]]:
-    return _safe_get("/health")
+def _metric_value(data: Optional[dict], key: str, default: Any = 0) -> Any:
+    if not isinstance(data, dict):
+        return default
+
+    value = data.get(key)
+
+    if value is None:
+        return default
+
+    return value
 
 
-@st.cache_data(ttl=2)
-def fetch_metrics(store_id: str) -> Optional[Dict[str, Any]]:
-    return _safe_get(f"/stores/{store_id}/metrics")
-
-
-@st.cache_data(ttl=2)
-def fetch_funnel(store_id: str) -> Optional[Dict[str, Any]]:
-    return _safe_get(f"/stores/{store_id}/funnel")
-
-
-@st.cache_data(ttl=2)
-def fetch_heatmap(store_id: str) -> Optional[Dict[str, Any]]:
-    return _safe_get(f"/stores/{store_id}/heatmap")
-
-
-@st.cache_data(ttl=2)
-def fetch_anomalies(store_id: str) -> Optional[Dict[str, Any]]:
-    return _safe_get(f"/stores/{store_id}/anomalies")
-
-
-def format_ms(ms_value: Any) -> str:
-    try:
-        ms = float(ms_value or 0)
-    except (TypeError, ValueError):
-        ms = 0.0
-
-    if ms <= 0:
-        return "0 sec"
-
-    seconds = ms / 1000
-
-    if seconds < 60:
-        return f"{seconds:.1f} sec"
-
-    minutes = seconds / 60
-    return f"{minutes:.1f} min"
-
-
-def render_status_badge(status: str):
-    status = (status or "UNKNOWN").upper()
-
-    if status in {"HEALTHY", "OK", "CONNECTED"}:
-        st.success(status)
-    elif status == "CRITICAL":
-        st.error(status)
-    elif status in {"WARN", "WARNING", "DEGRADED", "STALE"}:
-        st.warning(status)
-    else:
-        st.info(status)
-
-
-def render_header(store_id: str):
-    st.title("🛒 Store Intelligence Dashboard")
-    st.caption(
-        f"Store: `{store_id}` | API: `{API_BASE_URL}` | "
-        f"Auto-refresh: every {REFRESH_SECONDS} seconds"
-    )
-
-
-def render_store_selector() -> str:
-    unique_options = []
-    for option in STORE_OPTIONS:
-        if option not in unique_options:
-            unique_options.append(option)
-
-    selected_store = st.sidebar.selectbox(
-        "Select Store",
-        options=unique_options,
-        index=0,
-    )
-
-    st.sidebar.caption(
-        "The selector supports the current ST1008 sample data and "
-        "STORE_BLR_002 acceptance-gate checks."
-    )
-
-    return selected_store
-
-
-def render_health_panel(
-    health: Optional[Dict[str, Any]],
-    store_id: str,
-):
+def _render_health(health: Optional[dict], error: Optional[str]):
     st.subheader("System Health")
 
-    if not health:
-        st.warning("Health data unavailable.")
+    if error:
+        st.error(f"Health check failed: {error}")
         return
 
-    col1, col2, col3 = st.columns(3)
+    if not health:
+        st.warning("No health response received.")
+        return
 
-    api_status = health.get("status", "UNKNOWN")
-    database_status = health.get("database", {}).get("status", "UNKNOWN")
+    status = health.get("status", "unknown")
+    database_status = health.get("database", {}).get("status", "unknown")
 
-    store_health = health.get("stores", {}).get(store_id, {})
-    feed_status = store_health.get("feed_status", "NO_EVENTS")
-    last_event_timestamp = store_health.get("last_event_timestamp")
+    col1, col2 = st.columns(2)
 
     with col1:
-        st.metric("API Status", api_status)
-        render_status_badge(api_status)
+        st.metric("API Status", status)
 
     with col2:
         st.metric("Database", database_status)
-        render_status_badge(database_status)
 
-    with col3:
-        st.metric("Feed Status", feed_status)
-        render_status_badge(feed_status)
-
-    if last_event_timestamp:
-        st.info(f"Last event timestamp: `{last_event_timestamp}`")
-    else:
-        st.info("No event has been received yet for this store.")
-
-    warnings = health.get("warnings", []) + store_health.get("warnings", [])
+    warnings = health.get("warnings") or []
 
     if warnings:
-        st.warning("Warnings: " + ", ".join(warnings))
+        st.warning(", ".join(str(item) for item in warnings))
+
+    stores = health.get("stores") or {}
+
+    if stores:
+        rows = []
+
+        for store_id, store_info in stores.items():
+            rows.append(
+                {
+                    "store_id": store_id,
+                    "feed_status": store_info.get("feed_status"),
+                    "last_event_timestamp": store_info.get("last_event_timestamp"),
+                    "warnings": ", ".join(store_info.get("warnings") or []),
+                }
+            )
+
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    else:
+        st.info("No store event feeds have been received yet.")
 
 
-def render_metrics_panel(metrics: Optional[Dict[str, Any]]):
-    st.subheader("North Star KPIs")
+def _render_metrics(metrics: Optional[dict], error: Optional[str]):
+    st.subheader("North Star and Queue KPIs")
+
+    if error:
+        st.error(f"Metrics request failed: {error}")
+        return
 
     if not metrics:
-        st.warning("Metrics unavailable.")
+        st.warning("No metrics response received.")
         return
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric(
-            "Total Unique Visitors",
-            metrics.get("total_visitors", 0),
-        )
-
-    with col2:
-        st.metric(
-            "Total Conversions",
-            metrics.get("converted_visitors", 0),
-        )
-
-    with col3:
-        st.metric(
-            "Conversion Rate",
-            f"{metrics.get('conversion_rate_percentage', 0.0)}%",
-        )
-
-    st.subheader("Queue and Event KPIs")
-
-    col4, col5, col6 = st.columns(3)
-
-    with col4:
-        st.metric(
-            "Current Queue Depth",
-            metrics.get("current_queue_depth", 0),
-        )
-
-    with col5:
-        st.metric(
-            "Average Queue Wait",
-            format_ms(metrics.get("avg_queue_wait_ms", 0.0)),
-        )
-
-    with col6:
-        st.metric(
-            "Total Events",
-            metrics.get("total_events", 0),
-        )
-
-    last_event_timestamp = metrics.get("last_event_timestamp")
-
-    if last_event_timestamp:
-        st.caption(f"Latest event: `{last_event_timestamp}`")
-    else:
-        st.caption("No events received yet.")
-
-
-def render_funnel_panel(funnel: Optional[Dict[str, Any]]):
-    st.subheader("Shopper Funnel")
-
-    if not funnel:
-        st.warning("Funnel data unavailable.")
-        return
-
-    funnel_steps = funnel.get("funnel_steps", {})
-    insights = funnel.get("insights", {})
-
-    labels = [
-        "Entered Store",
-        "Visited Product Zone",
-        "Joined Billing Queue",
-        "Completed Purchase",
-    ]
-
-    values = [
-        funnel_steps.get("1_entered_store", 0),
-        funnel_steps.get("2_visited_zone", 0),
-        funnel_steps.get(
-            "3_entered_billing_queue",
-            funnel_steps.get("2_entered_billing_queue", 0),
-        ),
-        funnel_steps.get(
-            "4_completed_purchase",
-            funnel_steps.get("3_completed_purchase", 0),
-        ),
-    ]
-
-    fig = go.Figure(
-        go.Funnel(
-            y=labels,
-            x=values,
-            textinfo="value+percent initial",
-        )
-    )
-
-    fig.update_layout(
-        height=440,
-        margin=dict(l=20, r=20, t=30, b=20),
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Queue Insights")
 
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
+        st.metric("Total Visitors", _metric_value(metrics, "total_visitors"))
+
+    with col2:
+        st.metric("Converted Visitors", _metric_value(metrics, "converted_visitors"))
+
+    with col3:
         st.metric(
-            "Queue Abandonment Count",
-            insights.get("queue_abandonment_count", 0),
+            "Conversion Rate",
+            f"{_metric_value(metrics, 'conversion_rate_percentage', 0)}%",
         )
+
+    with col4:
+        st.metric("Total Events", _metric_value(metrics, "total_events"))
+
+    col5, col6, col7 = st.columns(3)
+
+    with col5:
+        st.metric("Current Queue Depth", _metric_value(metrics, "current_queue_depth"))
+
+    with col6:
+        st.metric("Avg Queue Wait", f"{_metric_value(metrics, 'avg_queue_wait_ms', 0)} ms")
+
+    with col7:
+        st.metric(
+            "Last Event",
+            _metric_value(metrics, "last_event_timestamp", "No events"),
+        )
+
+
+def _render_funnel(funnel: Optional[dict], error: Optional[str]):
+    st.subheader("Shopper Funnel")
+
+    if error:
+        st.error(f"Funnel request failed: {error}")
+        return
+
+    if not funnel:
+        st.warning("No funnel response received.")
+        return
+
+    steps = funnel.get("funnel_steps") or {}
+
+    funnel_rows = [
+        {
+            "stage": "1. Entered Store",
+            "count": steps.get("1_entered_store", 0),
+        },
+        {
+            "stage": "2. Visited Product Zone",
+            "count": steps.get("2_visited_zone", 0),
+        },
+        {
+            "stage": "3. Entered Billing Queue",
+            "count": steps.get("3_entered_billing_queue", 0),
+        },
+        {
+            "stage": "4. Completed Purchase",
+            "count": steps.get("4_completed_purchase", 0),
+        },
+    ]
+
+    funnel_df = pd.DataFrame(funnel_rows)
+
+    st.dataframe(funnel_df, use_container_width=True)
+
+    if not funnel_df.empty:
+        st.bar_chart(funnel_df.set_index("stage"))
+
+
+def _render_queue_insights(funnel: Optional[dict]):
+    st.subheader("Queue Insights")
+
+    if not funnel:
+        st.info("No queue insight data available.")
+        return
+
+    insights = funnel.get("insights") or {}
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.metric("Abandonment Count", insights.get("queue_abandonment_count", 0))
 
     with col2:
         st.metric(
-            "Queue Abandonment Rate",
+            "Abandonment Rate",
             f"{insights.get('queue_abandonment_rate', 0.0)}%",
         )
 
     with col3:
-        st.metric(
-            "Completed Queue Cycles",
-            insights.get("completed_queue_cycles", 0),
-        )
+        st.metric("Completed Queue Cycles", insights.get("completed_queue_cycles", 0))
 
     with col4:
-        st.metric(
-            "Abandoned Queue Cycles",
-            insights.get("abandoned_queue_cycles", 0),
-        )
-
-    st.caption(
-        f"Current queue depth: {insights.get('current_queue_depth', 0)} | "
-        f"Average queue wait: {format_ms(insights.get('avg_queue_wait_ms', 0.0))} | "
-        f"Source: {insights.get('queue_data_source', 'unknown')}"
-    )
+        st.metric("Open Queue Depth", insights.get("current_queue_depth", 0))
 
 
-def render_heatmap_panel(heatmap: Optional[Dict[str, Any]]):
-    st.subheader("Zone Heatmap")
+def _render_anomalies(anomalies: Optional[dict], error: Optional[str]):
+    st.subheader("Operational Anomalies")
 
-    if not heatmap:
-        st.warning("Heatmap data unavailable.")
+    if error:
+        st.error(f"Anomalies request failed: {error}")
         return
-
-    data_confidence = heatmap.get("data_confidence", "UNKNOWN")
-    zones = heatmap.get("zones", [])
-
-    st.caption(f"Heatmap type: `{heatmap.get('heatmap_type', 'zone_level')}`")
-    st.caption(f"Data confidence: `{data_confidence}`")
-
-    if not zones:
-        st.info("No zone-level heatmap data available yet.")
-        return
-
-    df = pd.DataFrame(zones)
-
-    expected_columns = [
-        "zone_id",
-        "visit_count",
-        "avg_dwell_ms",
-        "heat_score",
-    ]
-
-    for col in expected_columns:
-        if col not in df.columns:
-            df[col] = None
-
-    df = df[expected_columns]
-
-    st.dataframe(df, use_container_width=True)
-
-    chart_df = df.copy()
-    chart_df["heat_score"] = pd.to_numeric(
-        chart_df["heat_score"],
-        errors="coerce",
-    ).fillna(0)
-
-    fig = px.bar(
-        chart_df,
-        x="zone_id",
-        y="heat_score",
-        text="heat_score",
-        title="Zone Heat Score",
-    )
-
-    fig.update_layout(
-        height=380,
-        xaxis_title="Zone",
-        yaxis_title="Heat Score",
-        margin=dict(l=20, r=20, t=50, b=20),
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def render_anomalies_panel(anomalies_response: Optional[Dict[str, Any]]):
-    st.subheader("Active Anomalies")
-
-    if not anomalies_response:
-        st.warning("Anomaly data unavailable.")
-        return
-
-    status = anomalies_response.get("status", "UNKNOWN")
-    anomalies = anomalies_response.get("anomalies", [])
-
-    render_status_badge(status)
 
     if not anomalies:
-        st.success("No active anomalies detected.")
+        st.warning("No anomaly response received.")
         return
 
-    for anomaly in anomalies:
-        severity = anomaly.get("severity", "INFO")
-        anomaly_type = anomaly.get("type", "UNKNOWN")
-        message = anomaly.get("message", "")
-        suggested_action = anomaly.get("suggested_action", "")
-        evidence = anomaly.get("evidence", {})
+    status = anomalies.get("status", "UNKNOWN")
+    st.metric("Anomaly Status", status)
 
-        title = f"{severity}: {anomaly_type}"
+    anomaly_items = anomalies.get("anomalies") or []
+
+    if not anomaly_items:
+        st.success("No active anomalies.")
+        return
+
+    for item in anomaly_items:
+        severity = item.get("severity", "INFO")
+        message = item.get("message", "No message")
+        anomaly_type = item.get("type", "UNKNOWN")
 
         if severity == "CRITICAL":
-            st.error(title)
+            st.error(f"{anomaly_type}: {message}")
         elif severity == "WARN":
-            st.warning(title)
+            st.warning(f"{anomaly_type}: {message}")
         else:
-            st.info(title)
+            st.info(f"{anomaly_type}: {message}")
 
-        with st.expander(f"Details - {anomaly_type}", expanded=True):
-            st.write(message)
+        suggested_action = item.get("suggested_action")
+        if suggested_action:
+            st.caption(f"Suggested action: {suggested_action}")
 
-            if suggested_action:
-                st.markdown("**Suggested Action:**")
-                st.write(suggested_action)
-
-            if evidence:
-                st.markdown("**Evidence:**")
+        evidence = item.get("evidence")
+        if isinstance(evidence, dict) and evidence:
+            with st.expander("Evidence"):
                 st.json(evidence)
 
 
-def render_dwell_summary(metrics: Optional[Dict[str, Any]]):
+def _render_heatmap(heatmap: Optional[dict], error: Optional[str]):
+    st.subheader("Zone Heatmap")
+
+    if error:
+        st.error(f"Heatmap request failed: {error}")
+        return
+
+    if not heatmap:
+        st.warning("No heatmap response received.")
+        return
+
+    st.caption(f"Data confidence: {heatmap.get('data_confidence', 'UNKNOWN')}")
+
+    zones = heatmap.get("zones") or []
+
+    if not zones:
+        st.info("No product-zone activity available yet.")
+        return
+
+    zone_df = pd.DataFrame(zones)
+
+    st.dataframe(zone_df, use_container_width=True)
+
+    if "zone_id" in zone_df.columns and "heat_score" in zone_df.columns:
+        chart_df = zone_df[["zone_id", "heat_score"]].set_index("zone_id")
+        st.bar_chart(chart_df)
+
+
+def _render_dwell_summary(metrics: Optional[dict]):
     st.subheader("Average Product-Zone Dwell")
 
     if not metrics:
-        st.warning("Dwell data unavailable.")
+        st.info("No dwell metrics available.")
         return
 
-    dwell_map = metrics.get("avg_dwell_ms_by_zone", {})
+    dwell_by_zone = metrics.get("avg_dwell_ms_by_zone") or {}
 
-    if not dwell_map:
-        st.info("No dwell events available yet.")
+    if not dwell_by_zone:
+        st.info("No dwell data available yet.")
         return
 
     rows = [
         {
             "zone_id": zone_id,
-            "avg_dwell": format_ms(avg_ms),
-            "avg_dwell_ms": avg_ms,
+            "avg_dwell_ms": avg_dwell_ms,
         }
-        for zone_id, avg_ms in dwell_map.items()
+        for zone_id, avg_dwell_ms in dwell_by_zone.items()
     ]
 
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True)
+    dwell_df = pd.DataFrame(rows)
+
+    st.dataframe(dwell_df, use_container_width=True)
+
+    if not dwell_df.empty:
+        st.bar_chart(dwell_df.set_index("zone_id"))
 
 
 def main():
-    selected_store_id = render_store_selector()
-    render_header(selected_store_id)
-
-    health = fetch_health()
-    metrics = fetch_metrics(selected_store_id)
-    funnel = fetch_funnel(selected_store_id)
-    heatmap = fetch_heatmap(selected_store_id)
-    anomalies = fetch_anomalies(selected_store_id)
-
-    with st.container():
-        render_health_panel(health, selected_store_id)
-
-    st.divider()
-
-    with st.container():
-        render_metrics_panel(metrics)
-
-    st.divider()
-
-    left_col, right_col = st.columns([1.2, 1])
-
-    with left_col:
-        render_funnel_panel(funnel)
-
-    with right_col:
-        render_anomalies_panel(anomalies)
-
-    st.divider()
-
-    heatmap_col, dwell_col = st.columns([1.2, 1])
-
-    with heatmap_col:
-        render_heatmap_panel(heatmap)
-
-    with dwell_col:
-        render_dwell_summary(metrics)
-
-    st.divider()
-
-    st.caption(
-        "Dashboard auto-refreshes. Keep the CV pipeline running in a second terminal "
-        "to see live updates."
+    st.set_page_config(
+        page_title="Retail Store Intelligence",
+        layout="wide",
     )
 
-    time.sleep(REFRESH_SECONDS)
+    st.title("Retail Store Intelligence Dashboard")
 
-    try:
+    st.sidebar.header("Controls")
+
+    store_options = _get_store_options()
+
+    selected_store = st.sidebar.selectbox(
+        "Store",
+        options=store_options,
+        index=0,
+    )
+
+    auto_refresh = st.sidebar.checkbox("Auto-refresh", value=False)
+    refresh_seconds = st.sidebar.slider(
+        "Refresh interval seconds",
+        min_value=5,
+        max_value=60,
+        value=15,
+        step=5,
+    )
+
+    if st.sidebar.button("Refresh now"):
         st.rerun()
-    except AttributeError:
-        st.experimental_rerun()
+
+    st.sidebar.caption(f"API: {API_BASE_URL}")
+
+    health, health_error = _get_json("/health")
+    metrics, metrics_error = _get_json(f"/stores/{selected_store}/metrics")
+    funnel, funnel_error = _get_json(f"/stores/{selected_store}/funnel")
+    heatmap, heatmap_error = _get_json(f"/stores/{selected_store}/heatmap")
+    anomalies, anomalies_error = _get_json(f"/stores/{selected_store}/anomalies")
+
+    st.caption(f"Selected store: `{selected_store}`")
+
+    _render_health(health, health_error)
+
+    st.divider()
+
+    _render_metrics(metrics, metrics_error)
+
+    st.divider()
+
+    left_col, right_col = st.columns(2)
+
+    with left_col:
+        _render_funnel(funnel, funnel_error)
+
+    with right_col:
+        _render_queue_insights(funnel)
+
+    st.divider()
+
+    _render_anomalies(anomalies, anomalies_error)
+
+    st.divider()
+
+    left_col, right_col = st.columns(2)
+
+    with left_col:
+        _render_heatmap(heatmap, heatmap_error)
+
+    with right_col:
+        _render_dwell_summary(metrics)
+
+    if auto_refresh:
+        time.sleep(refresh_seconds)
+        st.rerun()
 
 
 if __name__ == "__main__":

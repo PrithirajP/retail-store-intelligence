@@ -1,5 +1,3 @@
-# DESIGN.md
-
 # Retail Store Intelligence Platform — System Design
 
 ## 1. Purpose
@@ -26,7 +24,7 @@ The implementation prioritizes:
 * clear API behavior
 * reviewer-friendly setup
 * business-relevant metrics
-* honest documentation of limitations
+* honest documentation of production limitations
 * incremental implementation under challenge constraints
 
 ---
@@ -37,6 +35,18 @@ The implementation prioritizes:
 CCTV clips / sample event payloads
         ↓
 Edge CV pipeline or sample event replay
+        ↓
+YOLOv8n person detection
+        ↓
+ByteTrack local tracking
+        ↓
+Bottom-center foot-point extraction
+        ↓
+Directional entrance-line crossing
+        ↓
+Manual polygon zone detection
+        ↓
+Lightweight REENTRY matching
         ↓
 Raw event payloads
         ↓
@@ -89,6 +99,7 @@ Responsibilities:
 * anomaly detection
 * health monitoring
 * structured request logging
+* structured database failure responses
 
 ### `store-dashboard`
 
@@ -109,18 +120,33 @@ Responsibilities:
 
 ## 4. Edge CV Layer
 
-The CV pipeline currently runs on the host machine:
+The CV pipeline can run in two modes.
+
+### Host-side mode
 
 ```bash
 cd cv_pipeline
 python orchestrator.py
 ```
 
-This is an intentional edge-cloud split.
+### Optional Docker profile
 
-The API and dashboard run in Docker. The CV worker runs locally to avoid PyTorch/OpenCV/Ultralytics container compatibility problems on reviewer machines.
+```bash
+docker compose --profile cv up --build
+```
 
-This is documented as a production-readiness limitation, but it protects the acceptance gate by ensuring the API and dashboard start reliably.
+The optional `cv-worker` service:
+
+```text
+runs cv_pipeline/orchestrator.py
+mounts ./data into /app/data
+waits for store-api to become healthy
+posts events to http://store-api:8000/events/ingest
+```
+
+The host-side path remains useful for fast local validation. The Docker profile proves that the CV layer can also be containerized when sufficient Docker resources are available.
+
+This is an edge-cloud split: the CV process acts as an edge event producer, and the API acts as the backend event-ingestion service.
 
 ---
 
@@ -164,56 +190,91 @@ Reason for selection:
 
 Known limitation:
 
-ByteTrack IDs are camera-local. A shopper moving across cameras may receive multiple identities.
+ByteTrack IDs are camera-local. A shopper moving across non-overlapping cameras may receive multiple identities unless a higher-level Re-ID layer matches them.
 
 ---
 
-## 7. Re-ID Strategy
+## 7. Re-ID and Re-entry Strategy
+
+The system now implements a lightweight re-entry matching layer at configured entrance cameras.
 
 Current implementation:
 
 ```text
-Full cross-camera Re-ID is not implemented.
+ByteTrack-local tracking
++ directional entrance-line crossing
++ distance-based recent-exit matching
 ```
 
-Current identity strategy:
+When a visitor crosses outward through an entrance line, the tracker stores a short-lived exit candidate containing:
 
 ```text
-ByteTrack-local visitor IDs
+visitor_id
+exit_point
+exit_time
 ```
 
-Supported at API schema level:
+When a new local tracker ID later crosses inward near the same entrance within the configured time and distance threshold, the tracker can emit:
 
 ```text
 REENTRY
-session_seq
+```
+
+instead of a second `ENTRY`.
+
+This reduces re-entry double-counting for the same configured entrance camera.
+
+Supported event/session fields:
+
+```text
 visitor_id
+REENTRY
+session_seq
 store_id
 camera_id
 ```
 
-Not fully implemented in CV:
+Known limitation:
 
 ```text
-global visitor identity
-OSNet / TorchReID embeddings
-cross-camera identity stitching
-robust REENTRY emission
+Full appearance-embedding-based cross-camera Re-ID is not implemented.
 ```
 
-Future design:
+The current matcher does not compare clothing, appearance embeddings, or identity across all cameras. It is a lightweight geometric baseline.
+
+A production Re-ID upgrade can be added later using:
 
 ```text
-person crop → Re-ID embedding → vector similarity → global visitor ID → session stitching
+person crop → appearance embedding → vector similarity → global visitor ID → session stitching
 ```
-
-Reason for deferral:
-
-Full Re-ID requires additional model integration, embedding storage, threshold tuning, and cross-camera state management. Under the challenge timeline, the safer decision was to complete the full API/database/dashboard pipeline first.
 
 ---
 
-## 8. Zone Detection Strategy
+## 8. Entry and Exit Detection
+
+The CV pipeline supports directional entrance-line crossing for configured entrance cameras.
+
+Instead of relying only on `ENTRY_DOOR` polygon entry, the tracker stores the previous and current foot-point of each local track. If movement crosses the configured entrance line, the tracker emits:
+
+```text
+LINE_CROSS + direction=IN
+LINE_CROSS + direction=OUT
+```
+
+The orchestrator normalizes these events into:
+
+```text
+LINE_CROSS + IN  → ENTRY
+LINE_CROSS + OUT → EXIT
+```
+
+For cameras without an entrance line, the system can still use polygon-zone transition fallback behavior.
+
+This improves visitor counting compared with entry-zone-only logic, while keeping the implementation explainable and testable.
+
+---
+
+## 9. Zone Detection Strategy
 
 Implemented approach:
 
@@ -239,13 +300,14 @@ BILLING_QUEUE
 BEHIND_COUNTER
 MAKEUP
 SKINCARE
+PRODUCT_ZONE
 ```
 
 Layout images are useful as store-planning references, but CCTV pixel polygons still require camera-space calibration. Floor-plan coordinates cannot be directly used as CCTV coordinates without homography calibration.
 
 ---
 
-## 9. Staff Detection Strategy
+## 10. Staff Detection Strategy
 
 Implemented staff exclusion:
 
@@ -269,7 +331,7 @@ Strength:
 
 Known limitation:
 
-Roaming staff in aisles may still be counted as customers.
+Roaming floor staff in aisles may still be counted as customers.
 
 Future improvement:
 
@@ -280,7 +342,7 @@ Future improvement:
 
 ---
 
-## 10. Event Schema
+## 11. Event Schema
 
 Internal canonical schema:
 
@@ -326,11 +388,19 @@ BILLING_QUEUE_ABANDON
 REENTRY
 ```
 
+Tracker-level intermediate event:
+
+```text
+LINE_CROSS
+```
+
+The orchestrator normalizes `LINE_CROSS` into `ENTRY` or `EXIT` before API ingestion.
+
 ---
 
-## 11. Event Normalization Layer
+## 12. Event Normalization Layer
 
-The ingestion API now supports both:
+The ingestion API supports both:
 
 ```text
 canonical Event Schema v1.2
@@ -372,7 +442,7 @@ This keeps the internal schema stable while making the API tolerant to provided 
 
 ---
 
-## 12. API Design
+## 13. API Design
 
 Framework:
 
@@ -422,7 +492,11 @@ Returns:
 * conversion rate
 * current queue depth
 * average queue wait
-* average dwell by zone
+* queue abandonment count
+* queue abandonment rate
+* completed queue cycles
+* abandoned queue cycles
+* average dwell by product zone
 * total event count
 * last event timestamp
 
@@ -483,9 +557,11 @@ Reports:
 * feed freshness
 * warnings
 
+If database access fails, the API returns a structured degraded response and avoids raw stack traces.
+
 ---
 
-## 13. Database Design
+## 14. Database Design
 
 Database:
 
@@ -560,7 +636,7 @@ SQLite is acceptable for challenge evaluation but should be replaced by PostgreS
 
 ---
 
-## 14. POS Seeding
+## 15. POS Seeding
 
 The POS seeder supports both:
 
@@ -589,7 +665,7 @@ The parser skips malformed rows, deduplicates transaction IDs, and returns a see
 
 ---
 
-## 15. POS Correlation
+## 16. POS Correlation
 
 When a visitor exits billing, the API attempts to correlate that event with POS transactions.
 
@@ -608,13 +684,13 @@ sessions.is_converted = True
 
 Known limitation:
 
-Without full cross-camera Re-ID, conversion attribution is strongest inside the billing camera but not globally perfect.
+Without full appearance-based cross-camera Re-ID, conversion attribution is strongest inside the billing camera but not globally perfect across all cameras.
 
 ---
 
-## 16. Funnel Logic
+## 17. Funnel Logic
 
-The funnel now follows:
+The funnel follows:
 
 ```text
 1. Entered Store
@@ -640,9 +716,11 @@ BILLING_QUEUE_EXIT
 BILLING_QUEUE_ABANDON
 ```
 
+`REENTRY` events do not create a second top-of-funnel visitor session.
+
 ---
 
-## 17. Heatmap Logic
+## 18. Heatmap Logic
 
 Heatmap is zone-level, not pixel-level.
 
@@ -677,7 +755,7 @@ BEHIND_COUNTER
 
 ---
 
-## 18. Anomaly Detection
+## 19. Anomaly Detection
 
 Implemented anomaly detection is rule-based.
 
@@ -702,7 +780,7 @@ This design is explainable, deterministic, and suitable for challenge evaluation
 
 ---
 
-## 19. Dashboard Design
+## 20. Dashboard Design
 
 Framework:
 
@@ -728,16 +806,17 @@ The dashboard supports:
 
 ```text
 ST1008
+STORE_2
 STORE_BLR_002
 ST1076
 store_1076
 ```
 
-This supports the current sample store, acceptance-gate store, and sample-event stores.
+This supports the current store mapping, acceptance-gate store, and sample-event stores.
 
 ---
 
-## 20. Structured Logging
+## 21. Structured Logging
 
 Implemented in:
 
@@ -775,7 +854,7 @@ X-Trace-Id
 
 ---
 
-## 21. Testing Strategy
+## 22. Testing Strategy
 
 Implemented test strategy:
 
@@ -788,6 +867,7 @@ in-memory SQLite test DB
 Test coverage includes:
 
 * health endpoint
+* database failure degradation
 * valid event ingestion
 * duplicate event idempotency
 * malformed event partial success
@@ -798,12 +878,16 @@ Test coverage includes:
 * populated heatmap
 * anomaly rules
 * staff filtering
+* dashboard contract
+* directional line crossing
+* lightweight REENTRY matching
+* CV Docker profile contract
 
-CV model tests are not automated because YOLO/ByteTrack behavior depends on video files, model versions, and local hardware. CV behavior is validated manually by running the orchestrator.
+CV model output is not fully automated because YOLO/ByteTrack behavior depends on video files, model versions, and hardware. CV behavior is validated by running the orchestrator against local CCTV clips.
 
 ---
 
-## 22. AI-Assisted Decisions
+## 23. AI-Assisted Decisions
 
 AI assistance was used as an engineering review and implementation-planning tool, not as an uncontrolled code generator.
 
@@ -825,48 +909,61 @@ AI recommended computing queue depth and wait time from raw queue events instead
 Reason accepted:
 
 * queue events are local to the billing camera
-* avoids overdependence on missing global Re-ID
+* avoids overdependence on missing global appearance-based Re-ID
 * improves queue metric reliability
 
-### AI suggestion partially accepted: full session-based funnel
+### AI suggestion accepted: directional entrance-line crossing
 
-AI identified that the challenge expects a four-stage funnel. The accepted implementation adds `Visited Product Zone` while preserving backward-compatible response keys.
+AI identified that polygon-only entry detection could overcount visitors. The accepted implementation uses entrance-line crossing with `IN` and `OUT` direction.
 
-Reason partially accepted:
+Reason accepted:
 
-* improves challenge compliance
-* avoids breaking existing dashboard/tests
+* improves entry/exit semantics
+* reduces doorway boundary overcounting
+* remains simple and testable
 
-### AI suggestion rejected: immediate full Re-ID implementation
+### AI suggestion accepted: lightweight REENTRY matching
 
-AI suggested OSNet/TorchReID-style Re-ID as a production solution. This was rejected for the challenge implementation because it would increase dependency risk and implementation time.
+AI suggested improving re-entry handling without adding a heavy embedding model. The accepted implementation stores recent exits and emits `REENTRY` when a new inward crossing matches a recent exit.
 
-Reason rejected:
+Reason accepted:
 
-* high complexity
-* threshold tuning required
-* additional model integration
-* risk of destabilizing existing pipeline
+* reduces re-entry double counting
+* avoids adding a second deep model
+* keeps the system stable under challenge constraints
 
-### AI suggestion rejected: fully containerizing CV immediately
+### AI suggestion accepted: optional CV Docker profile
 
-AI suggested full Dockerization of the CV worker for production. This was deferred because PyTorch/OpenCV/Ultralytics containers can create reviewer-machine compatibility problems.
+AI suggested adding a containerized CV path without making it part of the default startup. The accepted design adds a Docker Compose `cv` profile.
+
+Reason accepted:
+
+* proves containerization path for CV
+* keeps default API/dashboard startup reliable
+* supports both host-side and containerized CV execution
+
+### AI suggestion rejected: immediate full appearance-based Re-ID
+
+AI suggested OSNet/TorchReID-style Re-ID as a production solution. This was deferred for the challenge implementation because it would increase dependency risk and require threshold tuning.
 
 Reason rejected for now:
 
-* high Docker image complexity
-* possible GPU/CPU dependency issues
-* API/dashboard stability was higher priority
+* high complexity
+* additional model integration
+* identity-merge risk
+* limited time for validation
 
 ---
 
-## 23. Implemented vs Planned
+## 24. Implemented vs Planned
 
 ### Implemented
 
 ```text
 YOLOv8n detection
 ByteTrack local tracking
+directional entrance-line crossing
+lightweight distance-based REENTRY matching
 manual polygon zone detection
 behind-counter staff heuristic
 Event Schema v1.2
@@ -885,40 +982,40 @@ health endpoint
 structured logging
 Streamlit dashboard
 expanded pytest tests
+optional CV Docker Compose profile
 ```
 
 ### Planned / Future
 
 ```text
-global cross-camera Re-ID
-full REENTRY emission from CV
+full appearance-based cross-camera Re-ID
+OSNet/TorchReID-style embedding matching
+global identity stitching across cameras
 periodic ZONE_DWELL every 30 seconds from CV
-fully Dockerized CV profile
 PostgreSQL migration
 Alembic migrations
 persistent edge buffer / DLQ
 WebSocket dashboard updates
-CV state-machine tests
+camera configuration API
+CV model regression tests
 ```
 
 ---
 
-## 24. Known Limitations
+## 25. Known Limitations
 
-1. Full cross-camera Re-ID is not implemented.
-2. ByteTrack IDs are camera-local.
-3. CV pipeline runs locally outside Docker.
+1. The system includes lightweight REENTRY matching, but full appearance-based cross-camera Re-ID is not implemented.
+2. Directional entry/exit detection depends on correctly calibrated entrance lines.
+3. The optional CV Docker profile may be heavier than the default API/dashboard Docker path because of PyTorch, OpenCV, and Ultralytics dependencies.
 4. Camera polygons are manually calibrated and hardcoded.
-5. `REENTRY` is schema-supported but not robustly emitted by CV.
-6. `ZONE_DWELL` cadence may not fully match every-30-second production behavior.
-7. SQLite is used instead of PostgreSQL.
-8. Dashboard uses polling, not WebSockets.
-9. Roaming staff may still be counted as customers.
-10. CV processing can be slow on CPU.
+5. SQLite is used for challenge deployment instead of PostgreSQL.
+6. Dashboard updates use polling rather than WebSockets.
+7. Roaming staff outside the behind-counter zone may still be counted as customers.
+8. Store 2 conversion remains zero unless POS data with `store_id = STORE_2` is available.
 
 ---
 
-## 25. Final Design Summary
+## 26. Final Design Summary
 
 The implemented system is a pragmatic challenge-ready retail intelligence platform.
 
@@ -931,7 +1028,7 @@ schema compatibility
 business metrics
 dashboard visibility
 testability
-honest limitations
+documented production limitations
 ```
 
-The largest remaining production gap is global cross-camera identity resolution.
+The largest remaining production gap is full appearance-based cross-camera identity resolution.

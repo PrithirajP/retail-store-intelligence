@@ -32,6 +32,14 @@ CCTV videos / sample event payloads
         ↓
 CV edge pipeline or event replay
         ↓
+YOLOv8n person detection
+        ↓
+ByteTrack local tracking
+        ↓
+Directional line-crossing + zone-state logic
+        ↓
+Lightweight REENTRY matching
+        ↓
 Event normalization layer
         ↓
 Canonical Event Schema v1.2
@@ -45,14 +53,14 @@ Metrics / Funnel / Heatmap / Anomalies / Health endpoints
 Streamlit dashboard
 ```
 
-The project uses an edge-cloud split:
+The project uses an edge-cloud style architecture:
 
 ```text
-Cloud layer: API + Dashboard inside Docker
-Edge layer: CV pipeline runs locally on the host machine
+Default cloud layer: API + Dashboard inside Docker
+Edge layer: CV pipeline running locally or through optional Docker profile
 ```
 
-This split avoids PyTorch/OpenCV/Ultralytics Docker compatibility issues while keeping the API and dashboard easy to run.
+The default Docker path is lightweight and starts the API and dashboard. The CV worker can be run locally or through the optional Docker Compose `cv` profile.
 
 ---
 
@@ -69,6 +77,7 @@ retail-store-intelligence/
 │   └── requirements.txt
 │
 ├── cv_pipeline/
+│   ├── Dockerfile
 │   ├── detector.py
 │   ├── event_emitter.py
 │   ├── orchestrator.py
@@ -86,6 +95,9 @@ retail-store-intelligence/
 │   ├── test_acceptance_gate.py
 │   ├── test_anomalies.py
 │   ├── test_anomaly_rules.py
+│   ├── test_compose_cv_profile.py
+│   ├── test_dashboard_contract.py
+│   ├── test_database_failure.py
 │   ├── test_funnel.py
 │   ├── test_funnel_session_logic.py
 │   ├── test_health.py
@@ -93,9 +105,12 @@ retail-store-intelligence/
 │   ├── test_heatmap_populated.py
 │   ├── test_ingest.py
 │   ├── test_metrics.py
+│   ├── test_reentry_funnel.py
+│   ├── test_reentry_tracking.py
 │   ├── test_sample_events_ingest.py
 │   ├── test_seed_data.py
-│   └── test_staff_filtering.py
+│   ├── test_staff_filtering.py
+│   └── test_tracker_line_crossing.py
 │
 ├── data/
 │   ├── README.md
@@ -208,7 +223,7 @@ http://localhost:8000/health
 http://localhost:8501
 ```
 
-### Step 2 — Run the CV Pipeline
+### Step 2 — Run the CV Pipeline Locally
 
 In a second terminal:
 
@@ -219,7 +234,7 @@ python orchestrator.py
 
 To run only one store:
 
-### Windows PowerShell
+#### Windows PowerShell
 
 ```powershell
 $env:ONLY_STORE="STORE_2"
@@ -232,7 +247,7 @@ To clear the single-store setting:
 Remove-Item Env:\ONLY_STORE
 ```
 
-### macOS / Linux
+#### macOS / Linux
 
 ```bash
 ONLY_STORE=STORE_2 python orchestrator.py
@@ -246,19 +261,19 @@ From the project root:
 pytest
 ```
 
-Expected result:
+Expected result after the final milestones:
 
 ```text
-32 passed
+all tests passed
 ```
 
-If dashboard contract tests are added, the expected count may increase.
+The current test suite covers ingestion, idempotency, sample-event normalization, metrics, funnel, heatmap, anomalies, staff filtering, dashboard contract, database failure handling, line crossing, and re-entry logic.
 
 ---
 
 ## 6. Local CV Environment Setup
 
-The CV pipeline runs outside Docker.
+The CV pipeline can run outside Docker.
 
 ### Windows PowerShell
 
@@ -291,7 +306,65 @@ This processes fewer frames and is useful for quicker local validation.
 
 ---
 
-## 7. Docker Services
+## 7. Optional CV Docker Profile
+
+By default, Docker Compose starts only the API and dashboard:
+
+```bash
+docker compose up --build
+```
+
+The CV pipeline can also be run through an optional Docker Compose profile:
+
+```bash
+docker compose --profile cv up --build
+```
+
+The optional CV worker service runs:
+
+```bash
+python orchestrator.py
+```
+
+inside the `cv_pipeline` container and sends events to:
+
+```text
+http://store-api:8000/events/ingest
+```
+
+The local `data/` folder is mounted into the container at:
+
+```text
+/app/data
+```
+
+Useful environment variables:
+
+```bash
+FRAME_SKIP=5
+ONLY_STORE=STORE_2
+DEBUG_EVENTS=1
+EVENT_BATCH_SIZE=50
+```
+
+Example:
+
+```bash
+ONLY_STORE=STORE_2 FRAME_SKIP=5 docker compose --profile cv up --build
+```
+
+The host-side CV run remains fully supported and is still the recommended lightweight path for local validation:
+
+```bash
+cd cv_pipeline
+python orchestrator.py
+```
+
+The Docker CV profile is optional because PyTorch, OpenCV, and Ultralytics can be heavier than the API/dashboard services.
+
+---
+
+## 8. Docker Services
 
 ### `store-api`
 
@@ -319,6 +392,7 @@ Responsibilities:
 * anomalies
 * health monitoring
 * structured logging
+* graceful database failure responses
 
 ### `store-dashboard`
 
@@ -342,9 +416,27 @@ Dashboard panels:
 * zone heatmap
 * average product-zone dwell
 
+### `cv-worker`
+
+Optional Docker Compose profile service.
+
+Run with:
+
+```bash
+docker compose --profile cv up --build
+```
+
+Responsibilities:
+
+* run YOLOv8n person detection
+* run ByteTrack local tracking
+* perform zone and line-crossing logic
+* emit structured events
+* stream events to the API
+
 ---
 
-## 8. API Endpoints
+## 9. API Endpoints
 
 ### Health
 
@@ -352,7 +444,9 @@ Dashboard panels:
 GET /health
 ```
 
-Returns API status, database status, latest event timestamp by store, and stale-feed warnings.
+Returns API status, database status, latest event timestamp by store, feed freshness, and warnings.
+
+If the database is unavailable, the endpoint returns a structured degraded response with HTTP 503.
 
 ---
 
@@ -434,6 +528,10 @@ converted_visitors
 conversion_rate_percentage
 current_queue_depth
 avg_queue_wait_ms
+queue_abandonment_count
+queue_abandonment_rate
+completed_queue_cycles
+abandoned_queue_cycles
 avg_dwell_ms_by_zone
 total_events
 last_event_timestamp
@@ -504,6 +602,14 @@ heat_score
 data_confidence
 ```
 
+The heatmap excludes operational zones such as:
+
+```text
+ENTRY_DOOR
+BILLING_QUEUE
+BEHIND_COUNTER
+```
+
 ---
 
 ### Anomalies
@@ -523,7 +629,7 @@ STALE_FEED
 
 ---
 
-## 9. Event Schema v1.2
+## 10. Event Schema v1.2
 
 Core fields:
 
@@ -563,9 +669,16 @@ BILLING_QUEUE_ABANDON
 REENTRY
 ```
 
+The CV tracker may emit intermediate `LINE_CROSS` events. The orchestrator normalizes:
+
+```text
+LINE_CROSS + IN  → ENTRY
+LINE_CROSS + OUT → EXIT
+```
+
 ---
 
-## 10. Sample Event Compatibility
+## 11. Sample Event Compatibility
 
 The ingestion API includes a normalization adapter.
 
@@ -592,7 +705,7 @@ This allows the API to accept both canonical internal events and uploaded sample
 
 ---
 
-## 11. POS Data Compatibility
+## 12. POS Data Compatibility
 
 The POS seeder supports two schemas.
 
@@ -626,7 +739,7 @@ returns a safe summary if the file is missing
 
 ---
 
-## 12. Camera Mapping
+## 13. Camera Mapping
 
 Current CV camera mapping is defined in:
 
@@ -639,14 +752,14 @@ cv_pipeline/orchestrator.py
 ```text
 CAM_1_ZONE      → data/ST1008/CAM_1_ZONE.mp4      → SKINCARE
 CAM_2_ZONE      → data/ST1008/CAM_2_ZONE.mp4      → MAKEUP
-CAM_3_ENTRY     → data/ST1008/CAM_3_ENTRY.mp4     → ENTRY_DOOR
+CAM_3_ENTRY     → data/ST1008/CAM_3_ENTRY.mp4     → ENTRY_DOOR / entrance line
 CAM_5_BILLING   → data/ST1008/CAM_5_BILLING.mp4   → BILLING_QUEUE / BEHIND_COUNTER
 ```
 
 ### STORE_2
 
 ```text
-ENTRY_1         → data/STORE_2/ENTRY_1.mp4        → ENTRY_DOOR
+ENTRY_1         → data/STORE_2/ENTRY_1.mp4        → ENTRY_DOOR / entrance line
 BILLING_AREA    → data/STORE_2/BILLING_AREA.mp4   → BILLING_QUEUE / BEHIND_COUNTER
 ZONE            → data/STORE_2/ZONE.mp4           → PRODUCT_ZONE
 ```
@@ -655,7 +768,39 @@ ZONE            → data/STORE_2/ZONE.mp4           → PRODUCT_ZONE
 
 ---
 
-## 13. Zone Mapping
+## 14. Entry, Exit, and Re-entry Logic
+
+The CV tracker stores the previous and current bottom-center foot point for each local track.
+
+For configured entrance cameras, the tracker checks whether the motion crosses the entrance line.
+
+It emits:
+
+```text
+LINE_CROSS + direction=IN
+LINE_CROSS + direction=OUT
+```
+
+The orchestrator normalizes these into:
+
+```text
+ENTRY
+EXIT
+```
+
+For re-entry support, the tracker stores recent exits for a short time window. If a new local track crosses inward near a recent exit location, the tracker emits:
+
+```text
+REENTRY
+```
+
+and maps the new local track back to the earlier visitor ID.
+
+This reduces double-counting for shoppers who leave and re-enter through the same configured entrance.
+
+---
+
+## 15. Zone Mapping
 
 Zone mapping is polygon-based.
 
@@ -670,12 +815,12 @@ It allows manual clicking of polygon points on the first frame of a video and pr
 Known limitation:
 
 ```text
-If a camera angle changes, polygons must be recalibrated.
+If a camera angle changes, polygons and entrance lines must be recalibrated.
 ```
 
 ---
 
-## 14. Staff Exclusion
+## 16. Staff Exclusion
 
 Implemented strategy:
 
@@ -707,7 +852,7 @@ Roaming floor staff may still be counted as customers.
 
 ---
 
-## 15. Queue Logic
+## 17. Queue Logic
 
 Queue events:
 
@@ -728,11 +873,11 @@ queue_abandonment_count
 queue_abandonment_rate
 ```
 
-Queue analytics are derived from the raw event stream, which is more reliable than global session state because full cross-camera Re-ID is not implemented.
+Queue analytics are derived from the raw event stream, which is more reliable than depending entirely on global cross-camera identity.
 
 ---
 
-## 16. Testing
+## 18. Testing
 
 Run:
 
@@ -740,16 +885,11 @@ Run:
 pytest
 ```
 
-Expected result:
-
-```text
-32 passed
-```
-
 Test coverage includes:
 
 ```text
 health endpoint
+database failure degradation
 valid event ingestion
 duplicate idempotency
 partial-success ingestion
@@ -760,13 +900,17 @@ session-based funnel
 populated heatmap
 anomaly rules
 staff filtering
+dashboard contract
+directional line crossing
+lightweight REENTRY matching
+CV Docker profile contract
 ```
 
-The CV model pipeline is not unit-tested because YOLO/ByteTrack output depends on local video files, model behavior, and hardware.
+The CV model output itself is not fully unit-tested because YOLO/ByteTrack behavior depends on local video files, model versions, and hardware.
 
 ---
 
-## 17. Structured Logging
+## 19. Structured Logging
 
 Every API request logs JSON-style structured fields:
 
@@ -798,7 +942,7 @@ X-Trace-Id
 
 ---
 
-## 18. AI-Assisted Engineering
+## 20. AI-Assisted Engineering
 
 AI assistance was used for:
 
@@ -816,63 +960,76 @@ Important decisions documented in `DESIGN.md` and `CHOICES.md`:
 event normalization adapter accepted
 event-derived queue analytics accepted
 four-stage funnel accepted
-full Re-ID deferred
-full CV Dockerization deferred
+directional line crossing accepted
+lightweight REENTRY matching accepted
+optional CV Docker profile accepted
+full appearance-based cross-camera Re-ID deferred
 ```
 
 ---
 
-## 19. Known Limitations
+## 21. Known Limitations
 
-1. Full cross-camera Re-ID is not implemented.
-2. ByteTrack IDs are camera-local.
-3. CV pipeline runs locally outside Docker.
-4. Camera polygons are manually calibrated and hardcoded.
-5. `REENTRY` is schema-supported but not robustly emitted by CV.
-6. `ZONE_DWELL` cadence may not fully satisfy every-30-second production behavior.
-7. SQLite is used instead of PostgreSQL.
-8. Dashboard uses polling, not WebSockets.
-9. Roaming staff may still be counted as customers.
-10. CV processing may be slow on CPU.
-11. Store 2 conversion remains zero unless POS data for `STORE_2` is provided.
+1. Full appearance-based cross-camera Re-ID is not implemented. The system now includes lightweight distance-based REENTRY matching at configured entrance cameras, but it does not compare person appearance embeddings across all cameras.
+
+2. Directional entry/exit detection depends on correctly calibrated entrance lines, camera angle, detection quality, and crowding near the doorway.
+
+3. The optional CV Docker profile may require more Docker disk, memory, and build time than the default API/dashboard services because of PyTorch, OpenCV, and Ultralytics dependencies.
+
+4. Camera polygons are manually calibrated and must be updated if camera angles change.
+
+5. SQLite is used for challenge deployment. Production should use PostgreSQL with migrations.
+
+6. Dashboard refresh uses polling rather than WebSockets.
+
+7. Roaming staff outside the behind-counter zone may still be counted as customers.
+
+8. Store 2 conversion remains zero unless POS transactions for `STORE_2` are provided.
 
 ---
 
-## 20. Production Improvements
+## 22. Production Improvements
 
 Recommended next steps for production:
 
 ```text
+full appearance-based cross-camera Re-ID
+OSNet/TorchReID-style embedding service
+global identity stitching across cameras
 PostgreSQL migration
 Alembic migrations
-global Re-ID service
 camera configuration API
 persistent edge event buffer
-optional CV Docker profile
 concurrent multi-camera processing
 WebSocket/SSE dashboard updates
 OpenTelemetry tracing
-CV state-machine tests
+CV model regression tests
 ```
 
 ---
 
-## 21. Final Submission Status
+## 23. Final Submission Status
 
 Current status:
 
 ```text
-READY FOR SUBMISSION WITH DOCUMENTED LIMITATIONS
+READY FOR SUBMISSION WITH DOCUMENTED PRODUCTION LIMITATIONS
 ```
 
 Strong points:
 
 ```text
 Dockerized API and dashboard
+optional Docker CV worker profile
+host-side CV edge pipeline
+YOLOv8n + ByteTrack detection/tracking
+directional entry/exit line crossing
+lightweight REENTRY matching
 robust event ingestion
 sample event compatibility
 dual POS parser
 session-based funnel
+queue abandonment metrics
 heatmap endpoint
 anomaly endpoint
 structured logging
@@ -880,11 +1037,11 @@ expanded pytest suite
 reviewer-friendly documentation
 ```
 
-Main limitations:
+Main production limitations:
 
 ```text
-no full cross-camera Re-ID
-CV worker outside Docker
-manual polygon calibration
+no full appearance-based cross-camera Re-ID
+manual polygon and entrance-line calibration
 SQLite used for challenge deployment
+polling dashboard instead of WebSockets
 ```

@@ -11,6 +11,7 @@ The project was implemented under challenge-style constraints, so decisions prio
 * implementation simplicity
 * production-oriented reasoning
 * business usefulness
+* honest documentation of limitations
 
 ---
 
@@ -37,7 +38,7 @@ YOLOv8n
 
 YOLOv8n gives a strong balance of speed, simplicity, and adequate person-detection quality for challenge-scale retail analytics.
 
-It also integrates easily with Ultralytics tracking.
+It integrates easily with Ultralytics tracking.
 
 ### Trade-off
 
@@ -80,64 +81,64 @@ ByteTrack handles low-confidence detections better than SORT and avoids the extr
 
 ### Trade-off
 
-ByteTrack gives local camera tracking only. It does not solve global cross-camera identity.
+ByteTrack gives local camera tracking only. It does not solve full global cross-camera identity by itself.
 
 ### Interview defense
 
-ByteTrack is a strong local tracker for a time-limited implementation. It gives stable enough IDs for zone and queue analytics while leaving a clean upgrade path to Re-ID.
+ByteTrack is a strong local tracker for a time-limited implementation. It gives stable enough IDs for zone and queue analytics while leaving a clean upgrade path to full Re-ID.
 
 ---
 
-## Decision 3 — Re-ID Strategy
+## Decision 3 — Re-ID and REENTRY Strategy
 
-### Previous ideal
-
-Implement full OSNet/TorchReID-based global identity.
-
-### Issue
-
-Full Re-ID would require:
-
-* crop extraction
-* second model inference
-* embedding storage
-* similarity thresholding
-* cross-camera state management
-* tuning and validation
-
-### Decision
-
-Defer full Re-ID.
-
-Current implementation:
+### Ideal production approach
 
 ```text
-ByteTrack-local visitor IDs
+OSNet / TorchReID-style appearance embeddings
+cross-camera identity matching
+global visitor ID assignment
+session stitching
 ```
+
+### Current implementation
+
+The project implements:
+
+```text
+lightweight distance-based REENTRY matching at configured entrance cameras
+```
+
+When a visitor exits through a configured entrance line, the tracker stores a recent-exit candidate. If a new local track crosses inward near that exit within the configured time and distance threshold, the tracker emits:
+
+```text
+REENTRY
+```
+
+and maps the new local track back to the earlier visitor ID.
 
 ### Rationale
 
-Completing API ingestion, database persistence, POS correlation, dashboard, and tests was higher priority than adding a partially reliable Re-ID layer.
+This provides a practical improvement over pure ByteTrack-local IDs without adding a second deep learning model, embedding storage, or threshold-heavy appearance matching.
 
 ### Trade-off
 
-A shopper crossing cameras may be counted more than once.
+This is not full cross-camera Re-ID. It works best for re-entry through the same configured entrance camera and depends on distance/time thresholds.
 
 ### Interview defense
 
-A weak Re-ID system can damage funnel accuracy more than no Re-ID. The implementation documents this limitation honestly and keeps the architecture ready for a future Re-ID module.
+Full Re-ID is valuable but risky to add under challenge constraints because false identity merges can damage visitor counts and conversion logic. The implemented lightweight matcher reduces re-entry double counting while preserving a clean future path to appearance-based Re-ID.
 
 ---
 
-## Decision 4 — Zone Detection
+## Decision 4 — Entry, Exit, and Zone Detection
 
 ### Alternatives considered
 
 ```text
-center point of bounding box
-bottom-center point of bounding box
-semantic segmentation
+entry-door polygon only
+directional line crossing
 homography-based floor projection
+semantic segmentation
 ```
 
 ### Decision
@@ -145,20 +146,22 @@ homography-based floor projection
 Use:
 
 ```text
-bottom-center point + polygon hit test
+bottom-center foot point
++ manual zone polygons
++ directional entrance-line crossing
 ```
 
 ### Rationale
 
-The bottom-center point better represents the person’s physical floor position in CCTV footage.
+The bottom-center of the bounding box approximates the person’s floor position. Manual polygons provide simple and explainable zone logic. Directional entrance lines improve entry/exit counting by detecting actual crossing direction.
 
 ### Trade-off
 
-Manual polygons are sensitive to camera drift and must be recalibrated if cameras move.
+Accuracy depends on camera calibration. If the entrance line or polygon is poorly placed, entry/exit counts can still be undercounted or overcounted.
 
 ### Interview defense
 
-Manual polygon zones are simple, explainable, fast, and appropriate for a challenge implementation.
+This is a practical CV architecture for fixed CCTV cameras. It is explainable, fast, testable, and does not require expensive segmentation or homography calibration for the challenge baseline.
 
 ---
 
@@ -403,7 +406,7 @@ BILLING_QUEUE_ABANDON
 
 ### Rationale
 
-Queue behavior is best inferred from billing-camera events. This is more reliable than depending entirely on global identity, which is not implemented.
+Queue behavior is best inferred from billing-camera events. This is more reliable than depending entirely on global identity, which is not fully appearance-based yet.
 
 ### Trade-off
 
@@ -411,7 +414,7 @@ Conversion attribution still depends on POS correlation.
 
 ### Interview defense
 
-This uses the strongest available signal for queue metrics and avoids overclaiming Re-ID capabilities.
+This uses the strongest available signal for queue metrics and avoids overclaiming full Re-ID capabilities.
 
 ---
 
@@ -558,51 +561,47 @@ The dashboard demonstrates business value quickly and keeps frontend complexity 
 
 ## Decision 16 — Containerization
 
-### Ideal
+### Default deployment
 
-Containerize:
-
-```text
-API
-Dashboard
-CV worker
-```
-
-### Issue
-
-Containerizing CV introduces risk from:
-
-* PyTorch image size
-* OpenCV system dependencies
-* CPU/GPU differences
-* reviewer-machine compatibility
-
-### Decision
-
-Containerize:
+The default Docker Compose path runs:
 
 ```text
-API
-Dashboard
+store-api
+store-dashboard
 ```
 
-Run locally:
+### Optional deployment
+
+The CV pipeline can also run through:
 
 ```text
-CV worker
+docker compose --profile cv up --build
 ```
+
+This starts an optional:
+
+```text
+cv-worker
+```
+
+service that runs `orchestrator.py`, mounts local challenge data, waits for the API health check, and posts events to the internal API service URL.
 
 ### Rationale
 
-This protects API/dashboard startup reliability.
+API and dashboard must be reliable for reviewer startup. The CV stack is heavier because it depends on PyTorch, OpenCV, Ultralytics, and tracking libraries. Making CV an optional profile gives reviewers two paths:
+
+```text
+lightweight default path: API + dashboard
+full optional path: API + dashboard + CV worker
+```
 
 ### Trade-off
 
-The entire pipeline is not single-command Docker.
+The optional CV Docker profile may require more Docker disk, memory, and build time than the default services.
 
 ### Interview defense
 
-This mirrors real edge-cloud architecture: video processing runs on an edge node and streams JSON events to a cloud API.
+This mirrors an edge-cloud system. The backend and dashboard run as services, while CV can run either locally as an edge process or inside a dedicated container profile.
 
 ---
 
@@ -658,12 +657,13 @@ Minimal tests only.
 
 ### Decision
 
-Expand deterministic API and business-logic tests.
+Expand deterministic API, business-logic, dashboard-contract, and tracker-state tests.
 
 ### Implemented test areas
 
 ```text
 health
+database failure degradation
 ingestion
 idempotency
 partial success
@@ -674,19 +674,23 @@ funnel stages
 heatmap
 anomaly rules
 staff filtering
+dashboard contract
+directional line crossing
+lightweight REENTRY matching
+CV Docker profile contract
 ```
 
 ### Rationale
 
-API and business logic are deterministic and suitable for automated testing. CV model output is hardware/model dependent and is validated manually.
+API, business logic, and tracker-state rules are deterministic and suitable for automated testing. Raw YOLO/ByteTrack model output is hardware/model dependent and is validated manually.
 
 ### Trade-off
 
-No automated YOLO/ByteTrack regression tests yet.
+No full automated CV model regression suite yet.
 
 ### Interview defense
 
-The test suite focuses on stable acceptance-gate and scoring-critical behavior first.
+The test suite focuses on stable acceptance-gate and scoring-critical behavior first, while leaving video/model regression testing as a production improvement.
 
 ---
 
@@ -695,7 +699,8 @@ The test suite focuses on stable acceptance-gate and scoring-critical behavior f
 ```text
 Detection Model: YOLOv8n
 Tracking Model: ByteTrack
-Re-ID Strategy: Planned, not implemented
+Re-ID Strategy: Lightweight same-entrance REENTRY matching; full appearance Re-ID planned
+Entry/Exit Strategy: Directional entrance-line crossing
 Zone Detection: Polygon + bottom-center point
 Queue Detection: Event-derived queue cycles
 Staff Detection: Behind-counter heuristic
@@ -704,6 +709,6 @@ Database: SQLite + SQLAlchemy
 API Framework: FastAPI
 Dashboard: Streamlit
 Logging: Standard logging with JSON-style records
-Testing: Expanded pytest API/business-logic suite
-Deployment: Docker Compose for API/dashboard, host-side CV
+Testing: Expanded pytest API/business/dashboard/tracker suite
+Deployment: Docker Compose for API/dashboard, optional cv-worker profile, host-side CV supported
 ```

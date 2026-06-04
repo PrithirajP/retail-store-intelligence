@@ -6,7 +6,6 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Mount challenge data so api/seed_data.py can read the POS CSV.
       - ./data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -20,6 +19,28 @@ services:
     container_name: store-dashboard
     ports:
       - "8501:8501"
+    environment:
+      API_BASE_URL: "http://store-api:8000"
+      STORE_OPTIONS: "ST1008,STORE_2"
+    depends_on:
+      store-api:
+        condition: service_healthy
+
+  cv-worker:
+    build:
+      context: ./cv_pipeline
+    container_name: cv-worker
+    profiles:
+      - cv
+    environment:
+      API_URL: "http://store-api:8000/events/ingest"
+      YOLO_MODEL: "yolov8n.pt"
+      FRAME_SKIP: "${FRAME_SKIP:-1}"
+      DEBUG_EVENTS: "${DEBUG_EVENTS:-0}"
+      ONLY_STORE: "${ONLY_STORE:-}"
+      EVENT_BATCH_SIZE: "${EVENT_BATCH_SIZE:-50}"
+    volumes:
+      - ./data:/app/data
     depends_on:
       store-api:
         condition: service_healthy

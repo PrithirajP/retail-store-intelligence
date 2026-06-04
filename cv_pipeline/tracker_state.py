@@ -2,6 +2,7 @@ import cv2
 import uuid
 import logging
 from datetime import datetime, timezone
+from math import sqrt
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,7 @@ class StoreTrackerState:
     - Convert tracked foot-points into zone transition events.
     - Track active dwell state per visitor.
     - Emit directional entrance-line crossing events.
+    - Emit lightweight distance-based REENTRY events.
     - Mark likely staff using BEHIND_COUNTER dwell heuristic.
     - Emit billing queue join/exit events.
     - Attach Event Schema v1.2 metadata:
@@ -29,6 +31,8 @@ class StoreTrackerState:
         camera_id: str,
         zones: dict,
         entrance_line: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None,
+        reentry_window_seconds: int = 600,
+        reentry_distance_px: int = 250,
     ):
         self.store_id = store_id
         self.camera_id = camera_id
@@ -47,8 +51,17 @@ class StoreTrackerState:
         # visitor_id -> local event sequence number
         self.session_seq = {}
 
-        # visitor_id -> previous foot point
+        # raw tracker visitor_id -> previous foot point
         self.last_points = {}
+
+        # raw tracker visitor_id -> global/lightweight visitor_id
+        self.track_to_global_id = {}
+
+        # recent exits used for lightweight re-entry matching
+        self.recent_exits = []
+
+        self.reentry_window_seconds = reentry_window_seconds
+        self.reentry_distance_px = reentry_distance_px
 
     # ------------------------------------------------------------------
     # Geometry helpers
@@ -63,9 +76,6 @@ class StoreTrackerState:
     def _line_side(self, point, line) -> float:
         """
         Signed side of a point relative to a directed line.
-
-        Positive and negative values indicate opposite sides of the line.
-        Zero means the point is approximately on the line.
         """
 
         (x1, y1), (x2, y2) = line
@@ -77,8 +87,8 @@ class StoreTrackerState:
         """
         Checks whether the point lies within the bounding box of the entrance line.
 
-        This prevents a long mathematical line from triggering crossings far away
-        from the actual doorway segment.
+        This prevents the infinite mathematical line from triggering crossings far
+        away from the actual doorway segment.
         """
 
         (x1, y1), (x2, y2) = line
@@ -103,7 +113,6 @@ class StoreTrackerState:
         prev_side = self._line_side(previous_point, self.entrance_line)
         curr_side = self._line_side(current_point, self.entrance_line)
 
-        # No crossing if both points are on same side.
         if prev_side == 0 and curr_side == 0:
             return False
 
@@ -112,7 +121,6 @@ class StoreTrackerState:
         if not crossed_sides:
             return False
 
-        # Use midpoint for segment-bound check.
         mid_point = (
             int((previous_point[0] + current_point[0]) / 2),
             int((previous_point[1] + current_point[1]) / 2),
@@ -125,8 +133,8 @@ class StoreTrackerState:
         Infers IN/OUT direction for an entrance-line crossing.
 
         Preferred rule:
-        - outside ENTRY_DOOR → inside ENTRY_DOOR = IN
-        - inside ENTRY_DOOR → outside ENTRY_DOOR = OUT
+        - outside ENTRY_DOOR -> inside ENTRY_DOOR = IN
+        - inside ENTRY_DOOR -> outside ENTRY_DOOR = OUT
 
         Fallback rule:
         - use signed line side change.
@@ -144,30 +152,90 @@ class StoreTrackerState:
         prev_side = self._line_side(previous_point, self.entrance_line)
         curr_side = self._line_side(current_point, self.entrance_line)
 
-        # Default convention:
-        # positive side → negative side means IN.
         if prev_side > 0 and curr_side <= 0:
             return "IN"
 
         return "OUT"
+
+    def _distance(self, point_a, point_b) -> float:
+        return sqrt(
+            (point_a[0] - point_b[0]) ** 2
+            + (point_a[1] - point_b[1]) ** 2
+        )
+
+    # ------------------------------------------------------------------
+    # Lightweight Re-ID helpers
+    # ------------------------------------------------------------------
+
+    def _prune_recent_exits(self, current_time: datetime):
+        """
+        Removes old exit candidates outside the re-entry window.
+        """
+
+        self.recent_exits = [
+            item
+            for item in self.recent_exits
+            if (current_time - item["exit_time"]).total_seconds()
+            <= self.reentry_window_seconds
+        ]
+
+    def _remember_exit(self, visitor_id: str, point, current_time: datetime):
+        """
+        Store a short-lived exit candidate for later REENTRY matching.
+        """
+
+        self._prune_recent_exits(current_time)
+
+        self.recent_exits.append(
+            {
+                "visitor_id": visitor_id,
+                "exit_point": point,
+                "exit_time": current_time,
+            }
+        )
+
+    def _match_reentry_candidate(self, point, current_time: datetime) -> Optional[str]:
+        """
+        Matches an inward crossing against recent exits.
+
+        This is a lightweight distance-based Re-ID baseline. It does not use
+        appearance embeddings. It is intended to reduce re-entry double counting
+        at the same configured entrance camera.
+        """
+
+        self._prune_recent_exits(current_time)
+
+        if not self.recent_exits:
+            return None
+
+        best_index = None
+        best_distance = None
+
+        for index, candidate in enumerate(self.recent_exits):
+            distance = self._distance(point, candidate["exit_point"])
+
+            if distance > self.reentry_distance_px:
+                continue
+
+            if best_distance is None or distance < best_distance:
+                best_index = index
+                best_distance = distance
+
+        if best_index is None:
+            return None
+
+        matched = self.recent_exits.pop(best_index)
+        return matched["visitor_id"]
 
     # ------------------------------------------------------------------
     # Event helpers
     # ------------------------------------------------------------------
 
     def _next_session_seq(self, visitor_id: str) -> int:
-        """
-        Returns the next local sequence number for a visitor.
-        """
-
         self.session_seq[visitor_id] = self.session_seq.get(visitor_id, 0) + 1
         return self.session_seq[visitor_id]
 
     def _current_queue_depth(self) -> int:
-        """
-        Calculates current billing queue depth from active dwell state.
-        """
-
         depth = 0
 
         for zone_map in self.active_dwells.values():
@@ -246,11 +314,15 @@ class StoreTrackerState:
         current_time_iso = current_time.isoformat()
 
         for track in tracks:
-            vid = track["visitor_id"]
+            raw_vid = track["visitor_id"]
             point = track["point"]
             conf = float(track["conf"])
 
-            previous_point = self.last_points.get(vid)
+            previous_point = self.last_points.get(raw_vid)
+
+            # If a raw tracker ID was already matched to an earlier global ID,
+            # use that global ID for all downstream events.
+            vid = self.track_to_global_id.get(raw_vid, raw_vid)
 
             if vid not in self.active_dwells:
                 self.active_dwells[vid] = {}
@@ -274,7 +346,6 @@ class StoreTrackerState:
             # 2. Zone transition and dwell state machine
             # ------------------------------------------------------------
             for zone_name, polygon in self.zones.items():
-                # BEHIND_COUNTER is used for staff detection only.
                 if zone_name == "BEHIND_COUNTER":
                     continue
 
@@ -295,23 +366,74 @@ class StoreTrackerState:
                             polygon,
                         )
 
-                        batch_events.append(
-                            self._build_event(
+                        if direction == "OUT":
+                            self._remember_exit(
                                 visitor_id=vid,
-                                event_type="LINE_CROSS",
-                                zone_id="ENTRY_DOOR",
-                                timestamp_iso=current_time_iso,
-                                is_staff=is_staff,
-                                confidence=conf,
-                                dwell_ms=None,
-                                queue_depth=None,
-                                sku_zone="ENTRY_DOOR",
-                                direction=direction,
+                                point=point,
+                                current_time=current_time,
                             )
-                        )
+
+                            batch_events.append(
+                                self._build_event(
+                                    visitor_id=vid,
+                                    event_type="LINE_CROSS",
+                                    zone_id="ENTRY_DOOR",
+                                    timestamp_iso=current_time_iso,
+                                    is_staff=is_staff,
+                                    confidence=conf,
+                                    dwell_ms=None,
+                                    queue_depth=None,
+                                    sku_zone="ENTRY_DOOR",
+                                    direction="OUT",
+                                )
+                            )
+
+                        else:
+                            matched_visitor_id = self._match_reentry_candidate(
+                                point=point,
+                                current_time=current_time,
+                            )
+
+                            if matched_visitor_id is not None:
+                                self.track_to_global_id[raw_vid] = matched_visitor_id
+                                vid = matched_visitor_id
+
+                                if vid not in self.active_dwells:
+                                    self.active_dwells[vid] = {}
+
+                                batch_events.append(
+                                    self._build_event(
+                                        visitor_id=vid,
+                                        event_type="REENTRY",
+                                        zone_id=None,
+                                        timestamp_iso=current_time_iso,
+                                        is_staff=is_staff,
+                                        confidence=conf,
+                                        dwell_ms=None,
+                                        queue_depth=None,
+                                        sku_zone=None,
+                                        direction=None,
+                                    )
+                                )
+
+                            else:
+                                batch_events.append(
+                                    self._build_event(
+                                        visitor_id=vid,
+                                        event_type="LINE_CROSS",
+                                        zone_id="ENTRY_DOOR",
+                                        timestamp_iso=current_time_iso,
+                                        is_staff=is_staff,
+                                        confidence=conf,
+                                        dwell_ms=None,
+                                        queue_depth=None,
+                                        sku_zone="ENTRY_DOOR",
+                                        direction="IN",
+                                    )
+                                )
 
                     # Maintain ENTRY_DOOR dwell state internally, but do not
-                    # emit ENTRY_DOOR ZONE_DWELL events.
+                    # emit ENTRY_DOOR dwell events.
                     if in_zone and not was_in_zone:
                         self.active_dwells[vid][zone_name] = current_time
 
@@ -375,7 +497,6 @@ class StoreTrackerState:
                         )
                     )
 
-                    # Emit dwell event for product zones.
                     if zone_name != "BILLING_QUEUE" and dwell_ms > 0:
                         batch_events.append(
                             self._build_event(
@@ -391,6 +512,6 @@ class StoreTrackerState:
                             )
                         )
 
-            self.last_points[vid] = point
+            self.last_points[raw_vid] = point
 
         return batch_events

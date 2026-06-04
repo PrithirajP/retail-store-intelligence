@@ -6,3 +6,4 @@ ultralytics==8.0.220
 opencv-python-headless==4.8.1.78
 requests==2.31.0
 numpy<2.0.0
+lapx>=0.5.2

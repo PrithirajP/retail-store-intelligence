@@ -1,3 +1,4 @@
+# Data / challenge files
 data/*
 !data/.gitkeep
 !data/README.md
@@ -6,17 +7,27 @@ data/*
 *.avi
 *.mov
 *.mkv
+*.csv
+*.jsonl
 *.png
 *.jpg
 *.jpeg
-*.csv
-*.jsonl
+
+# Databases
 *.db
 *.sqlite
 *.sqlite3
+
+# Model weights
 *.pt
 *.pth
-runs/
+*.onnx
+
+# Python
 venv/
 __pycache__/
 .pytest_cache/
+*.pyc
+
+# YOLO outputs/cache
+runs/

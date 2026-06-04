@@ -37,7 +37,7 @@ services:
       YOLO_MODEL: "yolov8n.pt"
       FRAME_SKIP: "${FRAME_SKIP:-1}"
       DEBUG_EVENTS: "${DEBUG_EVENTS:-0}"
-      ONLY_STORE: "${ONLY_STORE:-}"
+      ONLY_STORE: "${CV_ONLY_STORE:-}"
       EVENT_BATCH_SIZE: "${EVENT_BATCH_SIZE:-50}"
     volumes:
       - ./data:/app/data
